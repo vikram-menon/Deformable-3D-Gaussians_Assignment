@@ -259,13 +259,138 @@ def readPKUColmapMetadata(path):
     return sparse_path, cam_extrinsics_by_pku_id, cam_intrinsics
 
 
+def selectPKUEvenlySpaced(items, count, sort_items=True):
+    items = sorted(items) if sort_items else list(items)
+    if count < 0:
+        raise ValueError("PKU subset counts must be non-negative")
+    if count == 0 or len(items) == 0:
+        return []
+    if count >= len(items):
+        return items
+    step = len(items) / count
+    return [items[int(idx * step)] for idx in range(count)]
+
+
+def selectPKUCameraIds(all_camera_ids, train_count, test_count, eval):
+    all_camera_ids = sorted(all_camera_ids)
+    train_camera_ids = selectPKUEvenlySpaced(all_camera_ids, train_count)
+    if not eval:
+        return train_camera_ids, []
+
+    train_camera_id_set = set(train_camera_ids)
+    if len(train_camera_ids) > 0:
+        total_cameras = max(all_camera_ids) + 1
+        offset = max(1, int(round(total_cameras / len(train_camera_ids) / 2)))
+        test_candidates = []
+        for camera_id in train_camera_ids:
+            candidate = (camera_id + offset) % total_cameras
+            if candidate in all_camera_ids and candidate not in train_camera_id_set:
+                test_candidates.append(candidate)
+        if len(test_candidates) < test_count:
+            test_candidates.extend([c for c in all_camera_ids if c not in train_camera_id_set and c not in test_candidates])
+    else:
+        test_candidates = all_camera_ids
+
+    test_camera_ids = selectPKUEvenlySpaced(test_candidates, test_count, sort_items=False)
+    return train_camera_ids, test_camera_ids
+
+
+def getPKUFrameNames(path, camera_ids, start_frame, frame_stride, max_frames):
+    if frame_stride <= 0:
+        raise ValueError("pku_frame_stride must be greater than 0")
+    if start_frame < 0:
+        raise ValueError("pku_start_frame must be non-negative")
+
+    frame_name_sets = []
+    for camera_id in camera_ids:
+        image_dir = os.path.join(path, "per_view", f"cam_{camera_id}", "images")
+        if not os.path.isdir(image_dir):
+            raise FileNotFoundError(f"Missing PKU image directory: {image_dir}")
+        frame_names = {
+            name for name in os.listdir(image_dir)
+            if os.path.isfile(os.path.join(image_dir, name)) and name.lower().endswith((".png", ".jpg", ".jpeg"))
+        }
+        frame_name_sets.append(frame_names)
+
+    if len(frame_name_sets) == 0:
+        return []
+
+    common_frame_names = sorted(set.intersection(*frame_name_sets))
+    selected_frame_names = common_frame_names[start_frame::frame_stride]
+    if max_frames > 0:
+        selected_frame_names = selected_frame_names[:max_frames]
+    if len(selected_frame_names) == 0:
+        raise ValueError("PKU frame selection produced no frames")
+    return selected_frame_names
+
+
+def buildPKUCameraInfos(path, cam_extrinsics_by_pku_id, cam_intrinsics, camera_ids, frame_names):
+    cam_infos = []
+    frame_count = len(frame_names)
+    for camera_id in camera_ids:
+        if camera_id not in cam_extrinsics_by_pku_id:
+            raise ValueError(f"Missing COLMAP pose for PKU camera {camera_id}")
+
+        extr = cam_extrinsics_by_pku_id[camera_id]
+        intr = cam_intrinsics[extr.camera_id]
+        height = intr.height
+        width = intr.width
+        R = np.transpose(qvec2rotmat(extr.qvec))
+        T = np.array(extr.tvec)
+
+        if intr.model == "SIMPLE_PINHOLE":
+            focal_length_x = intr.params[0]
+            FovY = focal2fov(focal_length_x, height)
+            FovX = focal2fov(focal_length_x, width)
+        elif intr.model == "PINHOLE":
+            focal_length_x = intr.params[0]
+            focal_length_y = intr.params[1]
+            FovY = focal2fov(focal_length_y, height)
+            FovX = focal2fov(focal_length_x, width)
+        else:
+            assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
+
+        for frame_idx, frame_name in enumerate(frame_names):
+            image_path = os.path.join(path, "per_view", f"cam_{camera_id}", "images", frame_name)
+            image = Image.open(image_path)
+            image_name = f"cam_{camera_id}_{Path(frame_name).stem}"
+            fid = frame_idx / (frame_count - 1) if frame_count > 1 else 0.0
+            cam_infos.append(CameraInfo(uid=camera_id, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                                        image_path=image_path, image_name=image_name, width=width, height=height,
+                                        fid=fid))
+    return cam_infos
+
+
 def readPKUDyMvHumansSceneInfo(args):
     sparse_path, cam_extrinsics_by_pku_id, cam_intrinsics = readPKUColmapMetadata(args.source_path)
+    train_camera_ids, test_camera_ids = selectPKUCameraIds(
+        cam_extrinsics_by_pku_id.keys(), args.pku_train_cameras, args.pku_test_cameras, args.eval)
+    selected_camera_ids = train_camera_ids + test_camera_ids
+    frame_names = getPKUFrameNames(
+        args.source_path, selected_camera_ids, args.pku_start_frame, args.pku_frame_stride, args.pku_max_frames)
+    train_cam_infos = buildPKUCameraInfos(
+        args.source_path, cam_extrinsics_by_pku_id, cam_intrinsics, train_camera_ids, frame_names)
+    test_cam_infos = buildPKUCameraInfos(
+        args.source_path, cam_extrinsics_by_pku_id, cam_intrinsics, test_camera_ids, frame_names)
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+    ply_path = os.path.join(sparse_path, "points3D.ply")
+
     print("Reading PKU-DyMvHumans COLMAP metadata")
     print(f"PKU sparse path: {sparse_path}")
     print(f"PKU COLMAP camera poses: {len(cam_extrinsics_by_pku_id)}")
     print(f"PKU COLMAP intrinsics: {len(cam_intrinsics)}")
-    raise NotImplementedError("PKU-DyMvHumans CameraInfo construction will be added in Step 4")
+    print(f"PKU train cameras: {train_camera_ids}")
+    print(f"PKU test cameras: {test_camera_ids}")
+    print(f"PKU selected frames: {len(frame_names)}")
+    print(f"PKU train views: {len(train_cam_infos)}")
+    print(f"PKU test views: {len(test_cam_infos)}")
+
+    scene_info = SceneInfo(point_cloud=None,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path)
+    return scene_info
 
 
 def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png"):
