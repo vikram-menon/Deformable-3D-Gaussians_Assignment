@@ -206,8 +206,8 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
-                images = torch.tensor([], device="cuda")
-                gts = torch.tensor([], device="cuda")
+                l1_total = 0.0
+                psnr_total = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
                     if load2gpu_on_the_fly:
                         viewpoint.load2device()
@@ -219,8 +219,8 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                         renderFunc(viewpoint, scene.gaussians, *renderArgs, d_xyz, d_rotation, d_scaling, is_6dof)["render"],
                         0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                    images = torch.cat((images, image.unsqueeze(0)), dim=0)
-                    gts = torch.cat((gts, gt_image.unsqueeze(0)), dim=0)
+                    l1_total += l1_loss(image, gt_image).item()
+                    psnr_total += psnr(image.unsqueeze(0), gt_image.unsqueeze(0)).mean().item()
 
                     if load2gpu_on_the_fly:
                         viewpoint.load2device('cpu')
@@ -231,8 +231,8 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name),
                                                  gt_image[None], global_step=iteration)
 
-                l1_test = l1_loss(images, gts)
-                psnr_test = psnr(images, gts).mean()
+                l1_test = torch.tensor(l1_total / len(config['cameras']), device="cuda")
+                psnr_test = torch.tensor(psnr_total / len(config['cameras']), device="cuda")
                 if config['name'] == 'test' or len(validation_configs[0]['cameras']) == 0:
                     test_psnr = psnr_test
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
