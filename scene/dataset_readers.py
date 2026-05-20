@@ -11,6 +11,7 @@
 
 import os
 import sys
+import re
 from PIL import Image
 from typing import NamedTuple, Optional
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
@@ -218,6 +219,53 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
                            nerf_normalization=nerf_normalization,
                            ply_path=ply_path)
     return scene_info
+
+
+def resolvePKUSparsePath(path):
+    sparse_root = os.path.join(path, "data_COLMAP", "000000", "sparse")
+    sparse_zero = os.path.join(sparse_root, "0")
+    if os.path.isdir(sparse_zero):
+        return sparse_zero
+    return sparse_root
+
+
+def parsePKUCameraId(image_name):
+    match = re.search(r"image_c_(\d+)_f_\d+", os.path.basename(image_name))
+    if match is None:
+        raise ValueError(f"Could not parse PKU camera id from COLMAP image name: {image_name}")
+    return int(match.group(1))
+
+
+def readPKUColmapMetadata(path):
+    sparse_path = resolvePKUSparsePath(path)
+    try:
+        cameras_extrinsic_file = os.path.join(sparse_path, "images.bin")
+        cameras_intrinsic_file = os.path.join(sparse_path, "cameras.bin")
+        cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
+        cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
+    except:
+        cameras_extrinsic_file = os.path.join(sparse_path, "images.txt")
+        cameras_intrinsic_file = os.path.join(sparse_path, "cameras.txt")
+        cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
+        cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
+
+    cam_extrinsics_by_pku_id = {}
+    for extr in cam_extrinsics.values():
+        pku_camera_id = parsePKUCameraId(extr.name)
+        if pku_camera_id in cam_extrinsics_by_pku_id:
+            raise ValueError(f"Duplicate PKU camera id {pku_camera_id} in COLMAP metadata")
+        cam_extrinsics_by_pku_id[pku_camera_id] = extr
+
+    return sparse_path, cam_extrinsics_by_pku_id, cam_intrinsics
+
+
+def readPKUDyMvHumansSceneInfo(args):
+    sparse_path, cam_extrinsics_by_pku_id, cam_intrinsics = readPKUColmapMetadata(args.source_path)
+    print("Reading PKU-DyMvHumans COLMAP metadata")
+    print(f"PKU sparse path: {sparse_path}")
+    print(f"PKU COLMAP camera poses: {len(cam_extrinsics_by_pku_id)}")
+    print(f"PKU COLMAP intrinsics: {len(cam_intrinsics)}")
+    raise NotImplementedError("PKU-DyMvHumans CameraInfo construction will be added in Step 4")
 
 
 def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png"):
@@ -599,6 +647,7 @@ def readPlenopticVideoDataset(path, eval, num_images, hold_id=[0]):
 
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,  # colmap dataset reader from official 3D Gaussian [https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/]
+    "PKUDyMvHumans": readPKUDyMvHumansSceneInfo,
     "Blender": readNerfSyntheticInfo,  # D-NeRF dataset [https://drive.google.com/file/d/1uHVyApwqugXTFuIRRlE4abTW8_rrVeIK/view?usp=sharing]
     "DTU": readNeuSDTUInfo,  # DTU dataset used in Tensor4D [https://github.com/DSaurus/Tensor4D]
     "nerfies": readNerfiesInfo,  # NeRFies & HyperNeRF dataset proposed by [https://github.com/google/hypernerf/releases/tag/v0.1]
