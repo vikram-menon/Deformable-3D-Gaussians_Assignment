@@ -60,6 +60,11 @@ class ModelParams(ParamGroup):
         self.load2gpu_on_the_fly = False
         self.is_blender = False
         self.is_6dof = False
+        self.pku_train_cameras = 10
+        self.pku_test_cameras = 2
+        self.pku_frame_stride = 1
+        self.pku_max_frames = -1
+        self.pku_start_frame = 0
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
