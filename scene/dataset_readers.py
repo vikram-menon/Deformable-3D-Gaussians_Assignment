@@ -352,10 +352,9 @@ def buildPKUCameraInfos(path, cam_extrinsics_by_pku_id, cam_intrinsics, camera_i
 
         for frame_idx, frame_name in enumerate(frame_names):
             image_path = os.path.join(path, "per_view", f"cam_{camera_id}", "images", frame_name)
-            image = Image.open(image_path)
             image_name = f"cam_{camera_id}_{Path(frame_name).stem}"
             fid = frame_idx / (frame_count - 1) if frame_count > 1 else 0.0
-            cam_infos.append(CameraInfo(uid=camera_id, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+            cam_infos.append(CameraInfo(uid=camera_id, R=R, T=T, FovY=FovY, FovX=FovX, image=None,
                                         image_path=image_path, image_name=image_name, width=width, height=height,
                                         fid=fid))
     return cam_infos
