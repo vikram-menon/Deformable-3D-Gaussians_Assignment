@@ -360,6 +360,25 @@ def buildPKUCameraInfos(path, cam_extrinsics_by_pku_id, cam_intrinsics, camera_i
     return cam_infos
 
 
+def readPKUPointCloud(sparse_path):
+    ply_path = os.path.join(sparse_path, "points3D.ply")
+    bin_path = os.path.join(sparse_path, "points3D.bin")
+    txt_path = os.path.join(sparse_path, "points3D.txt")
+
+    if not os.path.exists(ply_path):
+        print("Converting PKU points3D to .ply, will happen only the first time you open the scene.")
+        if os.path.exists(bin_path):
+            xyz, rgb, _ = read_points3D_binary(bin_path)
+        elif os.path.exists(txt_path):
+            xyz, rgb, _ = read_points3D_text(txt_path)
+        else:
+            raise FileNotFoundError(f"Could not find PKU point cloud at {ply_path}, {bin_path}, or {txt_path}")
+        storePly(ply_path, xyz, rgb)
+
+    pcd = fetchPly(ply_path)
+    return ply_path, pcd
+
+
 def readPKUDyMvHumansSceneInfo(args):
     sparse_path, cam_extrinsics_by_pku_id, cam_intrinsics = readPKUColmapMetadata(args.source_path)
     train_camera_ids, test_camera_ids = selectPKUCameraIds(
@@ -372,7 +391,7 @@ def readPKUDyMvHumansSceneInfo(args):
     test_cam_infos = buildPKUCameraInfos(
         args.source_path, cam_extrinsics_by_pku_id, cam_intrinsics, test_camera_ids, frame_names)
     nerf_normalization = getNerfppNorm(train_cam_infos)
-    ply_path = os.path.join(sparse_path, "points3D.ply")
+    ply_path, pcd = readPKUPointCloud(sparse_path)
 
     print("Reading PKU-DyMvHumans COLMAP metadata")
     print(f"PKU sparse path: {sparse_path}")
@@ -383,8 +402,9 @@ def readPKUDyMvHumansSceneInfo(args):
     print(f"PKU selected frames: {len(frame_names)}")
     print(f"PKU train views: {len(train_cam_infos)}")
     print(f"PKU test views: {len(test_cam_infos)}")
+    print(f"PKU point cloud path: {ply_path}")
 
-    scene_info = SceneInfo(point_cloud=None,
+    scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
                            nerf_normalization=nerf_normalization,
