@@ -348,30 +348,64 @@ def make_paths_png(track_subset, labels, path, title, axes=(0, 1), size=(900, 62
     img.save(path)
 
 
-def render_track_overlay_videos(track_subset, selected_ids, selected_labels, cameras, output_dir, trail_length, stride, fps=12):
+def camera_time(camera):
+    fid = getattr(camera, "fid", None)
+    if fid is None:
+        return 0.0
+    if torch.is_tensor(fid):
+        return float(fid.detach().cpu().flatten()[0])
+    return float(fid)
+
+
+def select_camera_sequences(cameras, count):
+    groups = {}
+    for camera in cameras:
+        key = getattr(camera, "colmap_id", None)
+        if key is None:
+            key = camera.image_name.rsplit("_", 1)[0]
+        groups.setdefault(key, []).append(camera)
+
+    sequences = []
+    for key in sorted(groups.keys(), key=lambda value: str(value)):
+        sequence = sorted(groups[key], key=lambda camera: (camera_time(camera), camera.image_name))
+        if sequence:
+            sequences.append((key, sequence))
+        if len(sequences) >= count:
+            break
+    return sequences
+
+
+def nearest_camera_for_time(camera_sequence, time_value):
+    return min(camera_sequence, key=lambda camera: abs(camera_time(camera) - float(time_value)))
+
+
+def render_track_overlay_videos(track_subset, selected_ids, selected_labels, camera_sequences, times, output_dir, trail_length, stride, fps=12):
     videos = []
-    if imageio is None or track_subset.numel() == 0 or not cameras:
+    if imageio is None or track_subset.numel() == 0 or not camera_sequences:
         return videos
 
     output_dir.mkdir(parents=True, exist_ok=True)
     stride = max(1, int(stride))
     trail_length = max(1, int(trail_length))
+    times_np = torch.as_tensor(times).detach().cpu().numpy()
 
-    for camera in cameras:
-        projected = project_tracks_to_camera(track_subset, camera).numpy()
-        background = tensor_image_to_uint8(camera.original_image)
-        path = output_dir / f"track_overlay_{camera.image_name}.mp4"
+    for camera_key, camera_sequence in camera_sequences:
+        display_name = f"cam_{camera_key}" if isinstance(camera_key, int) else str(camera_key)
+        safe_name = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in display_name)
+        path = output_dir / f"track_overlay_{safe_name}.mp4"
         frames = []
-        for time_idx in range(0, projected.shape[0], stride):
+        for time_idx in range(0, track_subset.shape[0], stride):
+            frame_camera = nearest_camera_for_time(camera_sequence, times_np[time_idx])
+            projected = project_tracks_to_camera(track_subset[max(0, time_idx - trail_length + 1):time_idx + 1], frame_camera).numpy()
+            background = tensor_image_to_uint8(frame_camera.original_image)
             img = Image.fromarray(background.copy())
             draw = ImageDraw.Draw(img)
-            start = max(0, time_idx - trail_length + 1)
             for track_idx in range(projected.shape[1]):
                 color = TRACK_COLORS[int(selected_labels[track_idx]) % len(TRACK_COLORS)] if len(selected_labels) else TRACK_COLORS[0]
                 points = []
-                for hist_idx in range(start, time_idx + 1):
+                for hist_idx in range(projected.shape[0]):
                     x, y = projected[hist_idx, track_idx]
-                    if np.isfinite(x) and np.isfinite(y) and -50 <= x <= camera.image_width + 50 and -50 <= y <= camera.image_height + 50:
+                    if np.isfinite(x) and np.isfinite(y) and -50 <= x <= frame_camera.image_width + 50 and -50 <= y <= frame_camera.image_height + 50:
                         points.append((float(x), float(y)))
                 if len(points) >= 2:
                     for segment_idx in range(1, len(points)):
@@ -380,11 +414,11 @@ def render_track_overlay_videos(track_subset, selected_ids, selected_labels, cam
                 if points:
                     x, y = points[-1]
                     draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=color)
-            draw.rectangle((12, 12, 252, 44), fill=(255, 255, 255), outline=(180, 180, 180))
-            draw.text((22, 22), f"Moving Gaussian tracks, t={time_idx}", fill=(20, 20, 20))
+            draw.rectangle((12, 12, 352, 48), fill=(255, 255, 255), outline=(180, 180, 180))
+            draw.text((22, 22), f"Moving tracks, frame {time_idx}, {frame_camera.image_name}", fill=(20, 20, 20))
             frames.append(np.asarray(img))
         imageio.mimsave(path, frames, fps=fps, macro_block_size=1)
-        videos.append({"camera": camera.image_name, "path": str(path), "track_count": int(track_subset.shape[1])})
+        videos.append({"camera": display_name, "path": str(path), "track_count": int(track_subset.shape[1])})
     return videos
 
 
@@ -1140,17 +1174,26 @@ def main():
     selected_track_labels = labels[selected_track_idx].tolist() if selected_track_idx.numel() and labels.numel() else [-1] * len(selected_track_ids)
     selected_track_lengths = motion_metrics["path_length"][selected_track_idx].tolist() if selected_track_idx.numel() else []
 
-    video_cameras = [] if args.skip_track_video else (scene.getTestCameras() + scene.getTrainCameras())[:max(0, args.track_camera_count)]
-    video_camera_names = [camera.image_name for camera in video_cameras]
+    all_video_cameras = scene.getTestCameras() + scene.getTrainCameras()
+    video_camera_sequences = [] if args.skip_track_video else select_camera_sequences(all_video_cameras, max(0, args.track_camera_count))
+    video_camera_names = [
+        f"cam_{camera_key}" if isinstance(camera_key, int) else str(camera_key)
+        for camera_key, _ in video_camera_sequences
+    ]
     projected_track_sets = []
-    for camera in video_cameras:
-        projected_track_sets.append(project_tracks_to_camera(track_subset, camera).numpy() if track_subset.numel() else np.empty((tracks.shape[0], 0, 2), dtype=np.float32))
+    for _, camera_sequence in video_camera_sequences:
+        projected_frames = []
+        for time_idx, time_value in enumerate(times.tolist()):
+            frame_camera = nearest_camera_for_time(camera_sequence, time_value)
+            projected_frames.append(project_points(track_subset[time_idx], frame_camera).numpy() if track_subset.numel() else np.empty((0, 2), dtype=np.float32))
+        projected_track_sets.append(np.stack(projected_frames, axis=0) if projected_frames else np.empty((tracks.shape[0], 0, 2), dtype=np.float32))
 
     track_videos = [] if args.skip_track_video else render_track_overlay_videos(
         track_subset,
         selected_track_ids,
         selected_track_labels,
-        video_cameras,
+        video_camera_sequences,
+        times,
         videos_dir,
         args.trail_length,
         args.track_stride,
