@@ -293,6 +293,43 @@ def select_track_indices(moving_mask, labels, path_length, track_count):
     return torch.as_tensor(selected[:track_count], dtype=torch.long)
 
 
+def select_viewer_point_indices(moving_mask, path_length, opacities, point_count):
+    total = int(path_length.numel())
+    if total == 0 or point_count <= 0:
+        return torch.empty(0, dtype=torch.long)
+    if point_count >= total:
+        return torch.arange(total, dtype=torch.long)
+
+    path_length = torch.as_tensor(path_length).flatten()
+    opacities = torch.as_tensor(opacities).flatten()
+    moving_indices = torch.nonzero(moving_mask, as_tuple=False).flatten()
+    static_indices = torch.nonzero(~moving_mask, as_tuple=False).flatten()
+
+    moving_count = min(moving_indices.numel(), max(point_count // 2, int(point_count * 0.65)))
+    static_count = min(static_indices.numel(), point_count - moving_count)
+    if static_count + moving_count < point_count:
+        moving_count = min(moving_indices.numel(), point_count - static_count)
+
+    selected = []
+    if moving_count > 0:
+        order = torch.argsort(path_length[moving_indices], descending=True)
+        selected.extend(moving_indices[order[:moving_count]].tolist())
+    if static_count > 0:
+        order = torch.argsort(opacities[static_indices], descending=True)
+        selected.extend(static_indices[order[:static_count]].tolist())
+
+    if len(selected) < point_count:
+        selected_set = set(int(idx) for idx in selected)
+        order = torch.argsort(opacities, descending=True)
+        for idx in order.tolist():
+            if int(idx) not in selected_set:
+                selected.append(int(idx))
+            if len(selected) >= point_count:
+                break
+
+    return torch.as_tensor(selected[:point_count], dtype=torch.long)
+
+
 def project_tracks_to_camera(track_subset, camera):
     projected = []
     with torch.no_grad():
@@ -422,7 +459,7 @@ def render_track_overlay_videos(track_subset, selected_ids, selected_labels, cam
     return videos
 
 
-def export_track_samples(path, selected_ids, selected_labels, track_subset, path_lengths, projected_tracks, camera_names):
+def export_track_samples(path, selected_ids, selected_labels, track_subset, path_lengths, projected_tracks, camera_names, viewer_cloud_subset=None, viewer_cloud_groups=None):
     np.savez_compressed(
         path,
         gaussian_ids=np.asarray(selected_ids, dtype=np.int64),
@@ -431,7 +468,56 @@ def export_track_samples(path, selected_ids, selected_labels, track_subset, path
         path_length=np.asarray(path_lengths, dtype=np.float32),
         projected_tracks=np.asarray(projected_tracks, dtype=np.float32),
         camera_names=np.asarray(camera_names, dtype=str),
+        viewer_cloud_3d=torch.as_tensor(viewer_cloud_subset).detach().cpu().numpy() if viewer_cloud_subset is not None else np.empty((0, 0, 3), dtype=np.float32),
+        viewer_cloud_is_moving=torch.as_tensor(viewer_cloud_groups).detach().cpu().numpy() if viewer_cloud_groups is not None else np.empty((0,), dtype=np.int64),
     )
+
+
+def make_track_viewer_data(track_subset, selected_ids, selected_labels, path_lengths, cloud_subset=None, cloud_groups=None, max_frames=160):
+    tracks = torch.as_tensor(track_subset).detach().cpu()
+    cloud = torch.as_tensor(cloud_subset).detach().cpu() if cloud_subset is not None else torch.empty(0, 0, 3)
+    if tracks.numel() == 0 or tracks.shape[1] == 0:
+        return {"frames": [], "cloud_frames": [], "cloud_groups": [], "gaussian_ids": [], "clusters": [], "path_lengths": [], "bounds": None}
+
+    frame_count = tracks.shape[0]
+    if frame_count > max_frames:
+        frame_idx = torch.linspace(0, frame_count - 1, max_frames).long()
+        tracks = tracks[frame_idx]
+        if cloud.numel():
+            cloud = cloud[frame_idx]
+
+    values = tracks.numpy().astype(np.float32)
+    cloud_values = cloud.numpy().astype(np.float32) if cloud.numel() else np.empty((0, 0, 3), dtype=np.float32)
+    finite = np.isfinite(values).all(axis=-1)
+    cloud_finite = np.isfinite(cloud_values).all(axis=-1) if cloud_values.size else np.empty((0, 0), dtype=bool)
+    valid_parts = [values[finite]]
+    if cloud_values.size:
+        valid_parts.append(cloud_values[cloud_finite])
+    valid = np.concatenate([part.reshape(-1, 3) for part in valid_parts if part.size], axis=0)
+    if valid.size == 0:
+        bounds = None
+        center = np.zeros(3, dtype=np.float32)
+        scale = 1.0
+    else:
+        mins = valid.min(axis=0)
+        maxs = valid.max(axis=0)
+        center = (mins + maxs) * 0.5
+        scale = float(max(maxs - mins)) or 1.0
+        bounds = {"min": [finite_float(v) for v in mins], "max": [finite_float(v) for v in maxs]}
+
+    normalized = (values - center.reshape(1, 1, 3)) / scale
+    normalized_cloud = (cloud_values - center.reshape(1, 1, 3)) / scale if cloud_values.size else cloud_values
+    rounded = np.round(normalized, 5)
+    rounded_cloud = np.round(normalized_cloud, 5) if normalized_cloud.size else normalized_cloud
+    return {
+        "frames": rounded.tolist(),
+        "cloud_frames": rounded_cloud.tolist(),
+        "cloud_groups": [int(v) for v in torch.as_tensor(cloud_groups).flatten().tolist()] if cloud_groups is not None else [],
+        "gaussian_ids": [int(v) for v in selected_ids],
+        "clusters": [int(v) for v in selected_labels],
+        "path_lengths": [finite_float(v) for v in path_lengths],
+        "bounds": bounds,
+    }
 
 
 def ensure_source_path(args):
@@ -894,6 +980,8 @@ def write_dashboard(path, data, artifact_paths):
 
     plot_paths = artifact_paths.get("plots", {})
     videos = artifact_paths.get("videos", [])
+    track_viewer_data = artifact_paths.get("track_viewer_data", {"frames": []})
+    track_viewer_json = json.dumps(track_viewer_data, separators=(",", ":"))
     plot_panels = [
         image_panel("Static path length", relpath(plot_paths.get("static_path_length"), base_dir), "Near-static trajectories should concentrate close to zero."),
         image_panel("Moving path length", relpath(plot_paths.get("moving_path_length"), base_dir), "Moving trajectories are evaluated against other moving trajectories."),
@@ -938,6 +1026,13 @@ def write_dashboard(path, data, artifact_paths):
     td { font-size:14px; }
     img, video { width:100%; display:block; border:1px solid var(--line); background:#fff; }
     .plot-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(360px, 1fr)); gap:16px; }
+    .viewer-shell { background:#111827; border:1px solid #273244; border-radius:8px; overflow:hidden; }
+    .viewer-toolbar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; padding:12px; background:#182235; color:#eef2f7; }
+    .viewer-toolbar button { appearance:none; border:1px solid #52627a; background:#24324a; color:#eef2f7; border-radius:6px; padding:7px 10px; cursor:pointer; }
+    .viewer-toolbar button:hover { background:#31425f; }
+    .viewer-toolbar input[type="range"] { flex:1; min-width:180px; }
+    .viewer-toolbar label { color:#c9d4e5; font-size:13px; }
+    #trackViewer { width:100%; height:620px; display:block; background:#0b1020; touch-action:none; }
     code { background:#eef1f6; padding:2px 5px; border-radius:4px; }
     footer { color:var(--muted); font-size:13px; margin-top:32px; }
     @media (max-width: 720px) { header { padding:24px 20px; } main { padding:20px 14px 40px; } .plot-grid { grid-template-columns:1fr; } }
@@ -1005,7 +1100,20 @@ def write_dashboard(path, data, artifact_paths):
 
     <section>
       <h2>Trajectory Visualizations</h2>
-      <p>These visuals use selected moving Gaussians only. Tracks are selected from high path-length Gaussians while balancing across motion clusters when labels are available.</p>
+      <p>The 3D viewer shows an animated downsampled Gaussian point cloud plus selected moving-Gaussian trails before camera projection. This is the best view for checking whether the learned dancer-shaped Gaussian motion and the path geometry agree. Drag to rotate; scroll to zoom.</p>
+      <div class="viewer-shell">
+        <canvas id="trackViewer" width="1200" height="620"></canvas>
+        <div class="viewer-toolbar">
+          <button id="viewerPlay" type="button">Pause</button>
+          <button data-view="front" type="button">Front</button>
+          <button data-view="side" type="button">Side</button>
+          <button data-view="top" type="button">Top</button>
+          <label for="viewerFrame">Frame</label>
+          <input id="viewerFrame" type="range" min="0" max="0" value="0">
+          <span id="viewerReadout">0 / 0</span>
+        </div>
+      </div>
+      <p class="caption">Gray/cyan points are the animated Gaussian point cloud. Colored trails are selected moving Gaussians; colors indicate motion clusters.</p>
       <div class="plot-grid">{''.join(video_panels) if video_panels else '<div class="section-card">No MP4 overlay videos were generated. Check whether imageio is installed or use the 3D trajectory plots below.</div>'}</div>
       <div class="plot-grid">{''.join(plot_panels[5:])}</div>
     </section>
@@ -1022,6 +1130,205 @@ def write_dashboard(path, data, artifact_paths):
 
     <footer>Dashboard generated by <code>trajectory_metrics.py</code>. All paths are relative to this output directory.</footer>
   </main>
+  <script>
+  const TRACK_VIEWER_DATA = {track_viewer_json};
+  (() => {{
+    const canvas = document.getElementById('trackViewer');
+    const frameSlider = document.getElementById('viewerFrame');
+    const readout = document.getElementById('viewerReadout');
+    const playButton = document.getElementById('viewerPlay');
+    if (!canvas || !TRACK_VIEWER_DATA.frames || TRACK_VIEWER_DATA.frames.length === 0) {{
+      if (canvas) {{
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#0b1020';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#dbe4f0';
+        ctx.font = '20px Arial';
+        ctx.fillText('No 3D tracks available in this run.', 32, 48);
+      }}
+      return;
+    }}
+
+    const ctx = canvas.getContext('2d');
+    const frames = TRACK_VIEWER_DATA.frames;
+    const cloudFrames = TRACK_VIEWER_DATA.cloud_frames || [];
+    const cloudGroups = TRACK_VIEWER_DATA.cloud_groups || [];
+    const clusters = TRACK_VIEWER_DATA.clusters || [];
+    const palette = ['#e63946', '#1d3557', '#2a9d8f', '#f4a261', '#8338ec', '#ffb703', '#118ab2', '#06d6a0'];
+    let frame = 0;
+    let yaw = -0.75;
+    let pitch = 0.35;
+    let zoom = 1.15;
+    let playing = true;
+    let lastTick = 0;
+    let dragging = false;
+    let lastX = 0;
+    let lastY = 0;
+    const trail = Math.min(48, frames.length);
+
+    frameSlider.max = String(frames.length - 1);
+    frameSlider.value = '0';
+
+    function resizeCanvas() {{
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.max(640, Math.floor(rect.width * dpr));
+      canvas.height = Math.max(360, Math.floor(rect.height * dpr));
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      draw();
+    }}
+
+    function project(point) {{
+      const x = point[0], y = point[1], z = point[2];
+      const cy = Math.cos(yaw), sy = Math.sin(yaw);
+      const cp = Math.cos(pitch), sp = Math.sin(pitch);
+      const x1 = cy * x + sy * z;
+      const z1 = -sy * x + cy * z;
+      const y1 = cp * y - sp * z1;
+      const z2 = sp * y + cp * z1;
+      const scale = Math.min(canvas.clientWidth, canvas.clientHeight) * 0.68 * zoom / (1.8 + z2);
+      return [canvas.clientWidth * 0.5 + x1 * scale, canvas.clientHeight * 0.53 - y1 * scale, z2];
+    }}
+
+    function drawAxes() {{
+      const axes = [
+        [['X', '#ef4444'], [0.55, 0, 0]],
+        [['Y', '#22c55e'], [0, 0.55, 0]],
+        [['Z', '#38bdf8'], [0, 0, 0.55]],
+      ];
+      const origin = project([0, 0, 0]);
+      ctx.lineWidth = 2;
+      axes.forEach(([meta, end]) => {{
+        const projected = project(end);
+        ctx.strokeStyle = meta[1];
+        ctx.beginPath();
+        ctx.moveTo(origin[0], origin[1]);
+        ctx.lineTo(projected[0], projected[1]);
+        ctx.stroke();
+        ctx.fillStyle = meta[1];
+        ctx.fillText(meta[0], projected[0] + 6, projected[1] - 6);
+      }});
+    }}
+
+    function draw() {{
+      const width = canvas.clientWidth;
+      const height = canvas.clientHeight;
+      ctx.clearRect(0, 0, width, height);
+      const gradient = ctx.createLinearGradient(0, 0, 0, height);
+      gradient.addColorStop(0, '#0b1020');
+      gradient.addColorStop(1, '#111827');
+      ctx.fillStyle = gradient;
+      ctx.fillRect(0, 0, width, height);
+      ctx.font = '13px Arial';
+      drawAxes();
+
+      const cloud = cloudFrames[frame] || [];
+      const cloudPoints = [];
+      for (let i = 0; i < cloud.length; i++) {{
+        const p = project(cloud[i]);
+        cloudPoints.push([p[2], p, i]);
+      }}
+      cloudPoints.sort((a, b) => a[0] - b[0]);
+      cloudPoints.forEach((item) => {{
+        const isMoving = cloudGroups[item[2]] === 1;
+        ctx.globalAlpha = isMoving ? 0.72 : 0.34;
+        ctx.fillStyle = isMoving ? '#67e8f9' : '#cbd5e1';
+        const radius = isMoving ? 1.65 : 1.25;
+        ctx.beginPath();
+        ctx.arc(item[1][0], item[1][1], radius, 0, Math.PI * 2);
+        ctx.fill();
+      }});
+      ctx.globalAlpha = 1;
+
+      const start = Math.max(0, frame - trail + 1);
+      const trackCount = frames[frame][0] ? frames[frame].length : 0;
+      const segments = [];
+      for (let t = start + 1; t <= frame; t++) {{
+        const alpha = 0.18 + 0.72 * ((t - start) / Math.max(frame - start, 1));
+        for (let i = 0; i < trackCount; i++) {{
+          const p0 = project(frames[t - 1][i]);
+          const p1 = project(frames[t][i]);
+          segments.push([Math.max(p0[2], p1[2]), p0, p1, i, alpha]);
+        }}
+      }}
+      segments.sort((a, b) => a[0] - b[0]);
+      segments.forEach((seg) => {{
+        const color = palette[Math.abs(clusters[seg[3]] || 0) % palette.length];
+        ctx.globalAlpha = seg[4];
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(seg[1][0], seg[1][1]);
+        ctx.lineTo(seg[2][0], seg[2][1]);
+        ctx.stroke();
+      }});
+      ctx.globalAlpha = 1;
+      for (let i = 0; i < trackCount; i++) {{
+        const p = project(frames[frame][i]);
+        ctx.fillStyle = palette[Math.abs(clusters[i] || 0) % palette.length];
+        ctx.beginPath();
+        ctx.arc(p[0], p[1], 3.2, 0, Math.PI * 2);
+        ctx.fill();
+      }}
+      readout.textContent = `${{frame + 1}} / ${{frames.length}}`;
+      frameSlider.value = String(frame);
+    }}
+
+    function tick(ts) {{
+      if (playing && ts - lastTick > 65) {{
+        frame = (frame + 1) % frames.length;
+        lastTick = ts;
+        draw();
+      }}
+      requestAnimationFrame(tick);
+    }}
+
+    canvas.addEventListener('pointerdown', (event) => {{
+      dragging = true;
+      lastX = event.clientX;
+      lastY = event.clientY;
+      canvas.setPointerCapture(event.pointerId);
+    }});
+    canvas.addEventListener('pointermove', (event) => {{
+      if (!dragging) return;
+      yaw += (event.clientX - lastX) * 0.008;
+      pitch += (event.clientY - lastY) * 0.008;
+      pitch = Math.max(-1.35, Math.min(1.35, pitch));
+      lastX = event.clientX;
+      lastY = event.clientY;
+      draw();
+    }});
+    canvas.addEventListener('pointerup', () => {{ dragging = false; }});
+    canvas.addEventListener('wheel', (event) => {{
+      event.preventDefault();
+      zoom *= event.deltaY > 0 ? 0.92 : 1.08;
+      zoom = Math.max(0.35, Math.min(4.0, zoom));
+      draw();
+    }}, {{ passive: false }});
+    frameSlider.addEventListener('input', () => {{
+      frame = Number(frameSlider.value);
+      playing = false;
+      playButton.textContent = 'Play';
+      draw();
+    }});
+    playButton.addEventListener('click', () => {{
+      playing = !playing;
+      playButton.textContent = playing ? 'Pause' : 'Play';
+    }});
+    document.querySelectorAll('[data-view]').forEach((button) => {{
+      button.addEventListener('click', () => {{
+        const view = button.getAttribute('data-view');
+        if (view === 'front') {{ yaw = 0; pitch = 0; }}
+        if (view === 'side') {{ yaw = Math.PI / 2; pitch = 0; }}
+        if (view === 'top') {{ yaw = 0; pitch = Math.PI / 2 - 0.02; }}
+        draw();
+      }});
+    }});
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+    requestAnimationFrame(tick);
+  }})();
+  </script>
 </body>
 </html>
 """
@@ -1121,6 +1428,7 @@ def main():
     parser.add_argument("--knn_k", default=8, type=int)
     parser.add_argument("--motion_threshold", default=-1.0, type=float, help="Path-length threshold for moving Gaussians; negative uses adaptive threshold")
     parser.add_argument("--track_count", default=128, type=int, help="Moving Gaussian tracks to export and visualize")
+    parser.add_argument("--viewer_point_count", default=1800, type=int, help="Downsampled animated 3D Gaussian points shown in the dashboard viewer")
     parser.add_argument("--track_camera_count", default=2, type=int, help="Camera views used for track-overlay videos")
     parser.add_argument("--track_stride", default=2, type=int, help="Temporal stride for track-overlay videos")
     parser.add_argument("--trail_length", default=32, type=int, help="Number of sampled frames retained in each rendered trail")
@@ -1173,6 +1481,9 @@ def main():
     selected_track_ids = selected_cpu[selected_track_idx].tolist() if selected_track_idx.numel() else []
     selected_track_labels = labels[selected_track_idx].tolist() if selected_track_idx.numel() and labels.numel() else [-1] * len(selected_track_ids)
     selected_track_lengths = motion_metrics["path_length"][selected_track_idx].tolist() if selected_track_idx.numel() else []
+    viewer_point_idx = select_viewer_point_indices(moving_mask, motion_metrics["path_length"], opacity_cpu, args.viewer_point_count)
+    viewer_cloud_subset = tracks[:, viewer_point_idx, :] if viewer_point_idx.numel() else torch.empty(tracks.shape[0], 0, 3)
+    viewer_cloud_groups = moving_mask[viewer_point_idx].long() if viewer_point_idx.numel() else torch.empty(0, dtype=torch.long)
 
     all_video_cameras = scene.getTestCameras() + scene.getTrainCameras()
     video_camera_sequences = [] if args.skip_track_video else select_camera_sequences(all_video_cameras, max(0, args.track_camera_count))
@@ -1208,6 +1519,7 @@ def main():
         "opacity_min": float(args.opacity_min),
         "motion_threshold": finite_float(args.motion_threshold),
         "track_count": int(args.track_count),
+        "viewer_point_count": int(args.viewer_point_count),
         "track_camera_count": int(args.track_camera_count),
         "track_stride": int(args.track_stride),
         "trail_length": int(args.trail_length),
@@ -1268,6 +1580,14 @@ def main():
             "moving_paths_yz": plots_dir / "moving_paths_yz.png",
         },
         "videos": track_videos,
+        "track_viewer_data": make_track_viewer_data(
+            track_subset,
+            selected_track_ids,
+            selected_track_labels,
+            selected_track_lengths,
+            viewer_cloud_subset,
+            viewer_cloud_groups,
+        ),
     }
 
     (output_dir / "trajectory_metrics.json").write_text(json.dumps(results, indent=2))
@@ -1276,7 +1596,17 @@ def main():
     write_report(output_dir / "bonus_trajectory_report.md", results)
     if not args.skip_track_export:
         projected_export = np.stack(projected_track_sets, axis=0) if projected_track_sets else np.empty((0, tracks.shape[0], int(track_subset.shape[1]), 2), dtype=np.float32)
-        export_track_samples(output_dir / "track_samples.npz", selected_track_ids, selected_track_labels, track_subset, selected_track_lengths, projected_export, video_camera_names)
+        export_track_samples(
+            output_dir / "track_samples.npz",
+            selected_track_ids,
+            selected_track_labels,
+            track_subset,
+            selected_track_lengths,
+            projected_export,
+            video_camera_names,
+            viewer_cloud_subset,
+            viewer_cloud_groups,
+        )
 
     make_histogram_png(motion_metrics["path_length"].numpy(), artifact_paths["plots"]["path_length"], "Path length")
     make_histogram_png(motion_metrics["mean_speed"].numpy(), artifact_paths["plots"]["mean_speed"], "Mean speed")
