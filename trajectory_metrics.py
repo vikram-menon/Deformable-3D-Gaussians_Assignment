@@ -293,17 +293,37 @@ def select_track_indices(moving_mask, labels, path_length, track_count):
     return torch.as_tensor(selected[:track_count], dtype=torch.long)
 
 
-def select_viewer_point_indices(moving_mask, path_length, opacities, point_count):
+def select_viewer_point_indices(moving_mask, path_length, opacities, point_count, mode="moving"):
     total = int(path_length.numel())
-    if total == 0 or point_count <= 0:
+    if total == 0:
         return torch.empty(0, dtype=torch.long)
-    if point_count >= total:
-        return torch.arange(total, dtype=torch.long)
 
+    moving_mask = torch.as_tensor(moving_mask, dtype=torch.bool).flatten()
     path_length = torch.as_tensor(path_length).flatten()
     opacities = torch.as_tensor(opacities).flatten()
     moving_indices = torch.nonzero(moving_mask, as_tuple=False).flatten()
     static_indices = torch.nonzero(~moving_mask, as_tuple=False).flatten()
+
+    if mode == "moving":
+        if point_count < 0 or point_count >= moving_indices.numel():
+            return moving_indices
+        if point_count == 0 or moving_indices.numel() == 0:
+            return torch.empty(0, dtype=torch.long)
+        order = torch.argsort(path_length[moving_indices], descending=True)
+        return moving_indices[order[:point_count]]
+
+    if mode == "all":
+        if point_count < 0 or point_count >= total:
+            return torch.arange(total, dtype=torch.long)
+        if point_count == 0:
+            return torch.empty(0, dtype=torch.long)
+        order = torch.argsort(opacities, descending=True)
+        return order[:point_count]
+
+    if point_count <= 0:
+        return torch.empty(0, dtype=torch.long)
+    if point_count >= total:
+        return torch.arange(total, dtype=torch.long)
 
     moving_count = min(moving_indices.numel(), max(point_count // 2, int(point_count * 0.65)))
     static_count = min(static_indices.numel(), point_count - moving_count)
@@ -416,7 +436,7 @@ def nearest_camera_for_time(camera_sequence, time_value):
     return min(camera_sequence, key=lambda camera: abs(camera_time(camera) - float(time_value)))
 
 
-def render_track_overlay_videos(track_subset, selected_ids, selected_labels, camera_sequences, times, output_dir, trail_length, stride, fps=12):
+def render_track_overlay_videos(track_subset, selected_ids, selected_labels, camera_sequences, times, output_dir, trail_length, stride, fps=18):
     videos = []
     if imageio is None or track_subset.numel() == 0 or not camera_sequences:
         return videos
@@ -473,11 +493,31 @@ def export_track_samples(path, selected_ids, selected_labels, track_subset, path
     )
 
 
-def make_track_viewer_data(track_subset, selected_ids, selected_labels, path_lengths, cloud_subset=None, cloud_groups=None, max_frames=160):
+def make_track_viewer_data(track_subset, selected_ids, selected_labels, path_lengths, cloud_subset=None, cloud_groups=None, max_frames=160, max_tracks=2400, max_cloud_points=6000):
     tracks = torch.as_tensor(track_subset).detach().cpu()
     cloud = torch.as_tensor(cloud_subset).detach().cpu() if cloud_subset is not None else torch.empty(0, 0, 3)
+    cloud_groups_tensor = torch.as_tensor(cloud_groups).detach().cpu().flatten() if cloud_groups is not None else torch.empty(0, dtype=torch.long)
+    source_track_count = int(tracks.shape[1]) if tracks.ndim >= 2 else 0
+    source_cloud_count = int(cloud.shape[1]) if cloud.ndim >= 2 else 0
+    viewer_track_stride = 1
+    viewer_cloud_stride = 1
     if tracks.numel() == 0 or tracks.shape[1] == 0:
-        return {"frames": [], "cloud_frames": [], "cloud_groups": [], "gaussian_ids": [], "clusters": [], "path_lengths": [], "bounds": None}
+        return {"frames": [], "cloud_frames": [], "cloud_groups": [], "gaussian_ids": [], "clusters": [], "path_lengths": [], "bounds": None, "source_track_count": 0, "source_cloud_count": source_cloud_count, "viewer_track_stride": 1, "viewer_cloud_stride": viewer_cloud_stride}
+
+    if max_tracks > 0 and tracks.shape[1] > max_tracks:
+        viewer_track_stride = int(math.ceil(tracks.shape[1] / max_tracks))
+        track_idx = torch.arange(0, tracks.shape[1], viewer_track_stride)[:max_tracks]
+        tracks = tracks[:, track_idx, :]
+        selected_ids = [selected_ids[int(idx)] for idx in track_idx.tolist()]
+        selected_labels = [selected_labels[int(idx)] for idx in track_idx.tolist()]
+        path_lengths = [path_lengths[int(idx)] for idx in track_idx.tolist()]
+
+    if max_cloud_points > 0 and cloud.numel() and cloud.shape[1] > max_cloud_points:
+        viewer_cloud_stride = int(math.ceil(cloud.shape[1] / max_cloud_points))
+        cloud_idx = torch.arange(0, cloud.shape[1], viewer_cloud_stride)[:max_cloud_points]
+        cloud = cloud[:, cloud_idx, :]
+        if cloud_groups_tensor.numel():
+            cloud_groups_tensor = cloud_groups_tensor[cloud_idx]
 
     frame_count = tracks.shape[0]
     if frame_count > max_frames:
@@ -512,11 +552,15 @@ def make_track_viewer_data(track_subset, selected_ids, selected_labels, path_len
     return {
         "frames": rounded.tolist(),
         "cloud_frames": rounded_cloud.tolist(),
-        "cloud_groups": [int(v) for v in torch.as_tensor(cloud_groups).flatten().tolist()] if cloud_groups is not None else [],
+        "cloud_groups": [int(v) for v in cloud_groups_tensor.tolist()] if cloud_groups_tensor.numel() else [],
         "gaussian_ids": [int(v) for v in selected_ids],
         "clusters": [int(v) for v in selected_labels],
         "path_lengths": [finite_float(v) for v in path_lengths],
         "bounds": bounds,
+        "source_track_count": source_track_count,
+        "source_cloud_count": source_cloud_count,
+        "viewer_track_stride": viewer_track_stride,
+        "viewer_cloud_stride": viewer_cloud_stride,
     }
 
 
@@ -1035,7 +1079,7 @@ def write_dashboard(path, data, artifact_paths):
     .viewer-toolbar button:hover { background:#31425f; }
     .viewer-toolbar input[type="range"] { flex:1; min-width:180px; }
     .viewer-toolbar label { color:#c9d4e5; font-size:13px; }
-    #trackViewer { width:100%; height:620px; display:block; background:#0b1020; touch-action:none; }
+    #trackViewer, #pathViewer { width:100%; height:620px; display:block; background:#0b1020; touch-action:none; }
     code { background:#eef1f6; padding:2px 5px; border-radius:4px; }
     footer { color:var(--muted); font-size:13px; margin-top:32px; }
     @media (max-width: 720px) { header { padding:24px 20px; } main { padding:20px 14px 40px; } .plot-grid { grid-template-columns:1fr; } }
@@ -1117,6 +1161,17 @@ def write_dashboard(path, data, artifact_paths):
         </div>
       </div>
       <p class="caption">Gray/cyan points are the animated Gaussian point cloud. Colored trails are selected moving Gaussians; colors indicate motion clusters.</p>
+      <h3>Interactive moving paths</h3>
+      <p class="caption">This 3D path graph draws dashboard-sampled moving-Gaussian trajectories with adaptive decimation for browser responsiveness. Full selected tracks are still exported in <code>track_samples.npz</code>. Drag to rotate; scroll to zoom.</p>
+      <div class="viewer-shell">
+        <canvas id="pathViewer" width="1200" height="620"></canvas>
+        <div class="viewer-toolbar">
+          <button data-path-view="front" type="button">Front</button>
+          <button data-path-view="side" type="button">Side</button>
+          <button data-path-view="top" type="button">Top</button>
+          <span id="pathReadout">0 tracks</span>
+        </div>
+      </div>
       <div class="plot-grid">{''.join(video_panels) if video_panels else '<div class="section-card">No MP4 overlay videos were generated. Check whether imageio is installed or use the 3D trajectory plots below.</div>'}</div>
       <div class="plot-grid">{''.join(plot_panels[5:])}</div>
     </section>
@@ -1152,25 +1207,227 @@ def write_dashboard(path, data, artifact_paths):
       return;
     }}
 
-    const ctx = canvas.getContext('2d');
     const frames = TRACK_VIEWER_DATA.frames;
     const cloudFrames = TRACK_VIEWER_DATA.cloud_frames || [];
-    const cloudGroups = TRACK_VIEWER_DATA.cloud_groups || [];
-    const clusters = TRACK_VIEWER_DATA.clusters || [];
-    const palette = ['#e63946', '#1d3557', '#2a9d8f', '#f4a261', '#8338ec', '#ffb703', '#118ab2', '#06d6a0'];
+    const pointFrames = cloudFrames.length ? cloudFrames : frames;
+    const sourceCloudCount = TRACK_VIEWER_DATA.source_cloud_count || (pointFrames[0] ? pointFrames[0].length : 0);
+    const gl = canvas.getContext('webgl2', {{ antialias: true }}) || canvas.getContext('webgl', {{ antialias: true }});
+    if (!gl) {{
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#0b1020';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = '#dbe4f0';
+      ctx.font = '20px Arial';
+      ctx.fillText('WebGL is unavailable; cannot render all moving points efficiently.', 32, 48);
+      return;
+    }}
+
+    function compileShader(type, source) {{
+      const shader = gl.createShader(type);
+      gl.shaderSource(shader, source);
+      gl.compileShader(shader);
+      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {{
+        throw new Error(gl.getShaderInfoLog(shader) || 'shader compile failed');
+      }}
+      return shader;
+    }}
+
+    const vertexSource = `
+      attribute vec3 aPosition;
+      uniform float uYaw;
+      uniform float uPitch;
+      uniform float uZoom;
+      uniform float uAspect;
+      uniform float uPointSize;
+      void main() {{
+        float cy = cos(uYaw);
+        float sy = sin(uYaw);
+        float cp = cos(uPitch);
+        float sp = sin(uPitch);
+        float x1 = cy * aPosition.x + sy * aPosition.z;
+        float z1 = -sy * aPosition.x + cy * aPosition.z;
+        float y1 = cp * aPosition.y - sp * z1;
+        float z2 = sp * aPosition.y + cp * z1;
+        float scale = 1.35 * uZoom / max(0.25, 1.8 + z2);
+        gl_Position = vec4(x1 * scale * uAspect, y1 * scale, 0.0, 1.0);
+        gl_PointSize = uPointSize;
+      }}
+    `;
+    const fragmentSource = `
+      precision mediump float;
+      uniform vec4 uColor;
+      void main() {{
+        vec2 uv = gl_PointCoord * 2.0 - 1.0;
+        float r2 = dot(uv, uv);
+        if (r2 > 1.0) discard;
+        gl_FragColor = uColor;
+      }}
+    `;
+    const program = gl.createProgram();
+    gl.attachShader(program, compileShader(gl.VERTEX_SHADER, vertexSource));
+    gl.attachShader(program, compileShader(gl.FRAGMENT_SHADER, fragmentSource));
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {{
+      throw new Error(gl.getProgramInfoLog(program) || 'program link failed');
+    }}
+    gl.useProgram(program);
+
+    const positionLocation = gl.getAttribLocation(program, 'aPosition');
+    const yawLocation = gl.getUniformLocation(program, 'uYaw');
+    const pitchLocation = gl.getUniformLocation(program, 'uPitch');
+    const zoomLocation = gl.getUniformLocation(program, 'uZoom');
+    const aspectLocation = gl.getUniformLocation(program, 'uAspect');
+    const pointSizeLocation = gl.getUniformLocation(program, 'uPointSize');
+    const colorLocation = gl.getUniformLocation(program, 'uColor');
+    const pointBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, pointBuffer);
+    gl.enableVertexAttribArray(positionLocation);
+    gl.vertexAttribPointer(positionLocation, 3, gl.FLOAT, false, 0, 0);
+
+    function flattenPoints(points) {{
+      const out = new Float32Array(points.length * 3);
+      for (let i = 0; i < points.length; i++) {{
+        out[i * 3] = points[i][0];
+        out[i * 3 + 1] = points[i][1];
+        out[i * 3 + 2] = points[i][2];
+      }}
+      return out;
+    }}
+
+    const gpuFrames = pointFrames.map(flattenPoints);
     let frame = 0;
     let yaw = -0.75;
     let pitch = 0.35;
     let zoom = 1.15;
+    let pointSize = 4.0;
     let playing = true;
     let lastTick = 0;
     let dragging = false;
     let lastX = 0;
     let lastY = 0;
-    const trail = Math.min(48, frames.length);
 
-    frameSlider.max = String(frames.length - 1);
+    frameSlider.max = String(pointFrames.length - 1);
     frameSlider.value = '0';
+
+    function resizeCanvas() {{
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.max(640, Math.floor(rect.width * dpr));
+      canvas.height = Math.max(360, Math.floor(rect.height * dpr));
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      draw();
+    }}
+
+    function draw() {{
+      const points = gpuFrames[frame] || new Float32Array();
+      gl.clearColor(0.03, 0.06, 0.12, 1.0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.useProgram(program);
+      gl.bindBuffer(gl.ARRAY_BUFFER, pointBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, points, gl.DYNAMIC_DRAW);
+      gl.uniform1f(yawLocation, yaw);
+      gl.uniform1f(pitchLocation, pitch);
+      gl.uniform1f(zoomLocation, zoom);
+      gl.uniform1f(aspectLocation, canvas.height / Math.max(canvas.width, 1));
+      gl.uniform1f(pointSizeLocation, pointSize * (window.devicePixelRatio || 1));
+      gl.uniform4f(colorLocation, 0.40, 0.91, 0.98, 0.86);
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      gl.drawArrays(gl.POINTS, 0, points.length / 3);
+      readout.textContent = `${{frame + 1}} / ${{pointFrames.length}} | WebGL points ${{points.length / 3}}/${{sourceCloudCount}}`;
+      frameSlider.value = String(frame);
+    }}
+
+    function tick(ts) {{
+      if (playing && ts - lastTick > 65) {{
+        frame = (frame + 1) % pointFrames.length;
+        lastTick = ts;
+        draw();
+      }}
+      requestAnimationFrame(tick);
+    }}
+
+    canvas.addEventListener('pointerdown', (event) => {{
+      dragging = true;
+      lastX = event.clientX;
+      lastY = event.clientY;
+      canvas.setPointerCapture(event.pointerId);
+    }});
+    canvas.addEventListener('pointermove', (event) => {{
+      if (!dragging) return;
+      yaw += (event.clientX - lastX) * 0.008;
+      pitch += (event.clientY - lastY) * 0.008;
+      pitch = Math.max(-1.35, Math.min(1.35, pitch));
+      lastX = event.clientX;
+      lastY = event.clientY;
+      draw();
+    }});
+    canvas.addEventListener('pointerup', () => {{ dragging = false; }});
+    canvas.addEventListener('wheel', (event) => {{
+      event.preventDefault();
+      if (event.shiftKey) {{
+        pointSize *= event.deltaY > 0 ? 0.88 : 1.12;
+        pointSize = Math.max(1.0, Math.min(18.0, pointSize));
+      }} else {{
+        zoom *= event.deltaY > 0 ? 0.9 : 1.12;
+        zoom = Math.max(0.2, Math.min(40.0, zoom));
+      }}
+      draw();
+    }}, {{ passive: false }});
+    frameSlider.addEventListener('input', () => {{
+      frame = Number(frameSlider.value);
+      playing = false;
+      playButton.textContent = 'Play';
+      draw();
+    }});
+    playButton.addEventListener('click', () => {{
+      playing = !playing;
+      playButton.textContent = playing ? 'Pause' : 'Play';
+    }});
+    document.querySelectorAll('[data-view]').forEach((button) => {{
+      button.addEventListener('click', () => {{
+        const view = button.getAttribute('data-view');
+        if (view === 'front') {{ yaw = 0; pitch = 0; }}
+        if (view === 'side') {{ yaw = Math.PI / 2; pitch = 0; }}
+        if (view === 'top') {{ yaw = 0; pitch = Math.PI / 2 - 0.02; }}
+        draw();
+      }});
+    }});
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+    requestAnimationFrame(tick);
+  }})();
+  (() => {{
+    const canvas = document.getElementById('pathViewer');
+    const readout = document.getElementById('pathReadout');
+    if (!canvas || !TRACK_VIEWER_DATA.frames || TRACK_VIEWER_DATA.frames.length === 0) {{
+      if (canvas) {{
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#0b1020';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#dbe4f0';
+        ctx.font = '20px Arial';
+        ctx.fillText('No moving paths available in this run.', 32, 48);
+      }}
+      return;
+    }}
+
+    const ctx = canvas.getContext('2d');
+    const frames = TRACK_VIEWER_DATA.frames;
+    const clusters = TRACK_VIEWER_DATA.clusters || [];
+    const palette = ['#e63946', '#1d3557', '#2a9d8f', '#f4a261', '#8338ec', '#ffb703', '#118ab2', '#06d6a0'];
+    const trackCount = frames[0] ? frames[0].length : 0;
+    const sourceTrackCount = TRACK_VIEWER_DATA.source_track_count || trackCount;
+    const maxPathTracks = 1400;
+    const maxPathFrames = 90;
+    const trackStep = Math.max(1, Math.ceil(trackCount / maxPathTracks));
+    const frameStep = Math.max(1, Math.ceil(frames.length / maxPathFrames));
+    let yaw = -0.75;
+    let pitch = 0.35;
+    let zoom = 1.35;
+    let dragging = false;
+    let lastX = 0;
+    let lastY = 0;
 
     function resizeCanvas() {{
       const rect = canvas.getBoundingClientRect();
@@ -1189,7 +1446,7 @@ def write_dashboard(path, data, artifact_paths):
       const z1 = -sy * x + cy * z;
       const y1 = cp * y - sp * z1;
       const z2 = sp * y + cp * z1;
-      const scale = Math.min(canvas.clientWidth, canvas.clientHeight) * 0.68 * zoom / (1.8 + z2);
+      const scale = Math.min(canvas.clientWidth, canvas.clientHeight) * 0.72 * zoom / Math.max(0.25, 1.6 + z2);
       return [canvas.clientWidth * 0.5 + x1 * scale, canvas.clientHeight * 0.53 - y1 * scale, z2];
     }}
 
@@ -1218,72 +1475,45 @@ def write_dashboard(path, data, artifact_paths):
       const height = canvas.clientHeight;
       ctx.clearRect(0, 0, width, height);
       const gradient = ctx.createLinearGradient(0, 0, 0, height);
-      gradient.addColorStop(0, '#0b1020');
-      gradient.addColorStop(1, '#111827');
+      gradient.addColorStop(0, '#07111f');
+      gradient.addColorStop(1, '#101827');
       ctx.fillStyle = gradient;
       ctx.fillRect(0, 0, width, height);
       ctx.font = '13px Arial';
       drawAxes();
 
-      const cloud = cloudFrames[frame] || [];
-      const cloudPoints = [];
-      for (let i = 0; i < cloud.length; i++) {{
-        const p = project(cloud[i]);
-        cloudPoints.push([p[2], p, i]);
-      }}
-      cloudPoints.sort((a, b) => a[0] - b[0]);
-      cloudPoints.forEach((item) => {{
-        const isMoving = cloudGroups[item[2]] === 1;
-        ctx.globalAlpha = isMoving ? 0.72 : 0.34;
-        ctx.fillStyle = isMoving ? '#67e8f9' : '#cbd5e1';
-        const radius = isMoving ? 1.65 : 1.25;
-        ctx.beginPath();
-        ctx.arc(item[1][0], item[1][1], radius, 0, Math.PI * 2);
-        ctx.fill();
-      }});
-      ctx.globalAlpha = 1;
-
-      const start = Math.max(0, frame - trail + 1);
-      const trackCount = frames[frame][0] ? frames[frame].length : 0;
-      const segments = [];
-      for (let t = start + 1; t <= frame; t++) {{
-        const alpha = 0.18 + 0.72 * ((t - start) / Math.max(frame - start, 1));
-        for (let i = 0; i < trackCount; i++) {{
-          const p0 = project(frames[t - 1][i]);
-          const p1 = project(frames[t][i]);
-          segments.push([Math.max(p0[2], p1[2]), p0, p1, i, alpha]);
-        }}
-      }}
-      segments.sort((a, b) => a[0] - b[0]);
-      segments.forEach((seg) => {{
-        const color = palette[Math.abs(clusters[seg[3]] || 0) % palette.length];
-        ctx.globalAlpha = seg[4];
+      let drawnTracks = 0;
+      let drawnSegments = 0;
+      ctx.lineWidth = 1.6;
+      for (let i = 0; i < trackCount; i += trackStep) {{
+        const color = palette[Math.abs(clusters[i] || 0) % palette.length];
         ctx.strokeStyle = color;
-        ctx.lineWidth = 2;
+        ctx.globalAlpha = 0.52;
         ctx.beginPath();
-        ctx.moveTo(seg[1][0], seg[1][1]);
-        ctx.lineTo(seg[2][0], seg[2][1]);
+        let started = false;
+        for (let t = 0; t < frames.length; t += frameStep) {{
+          const p = project(frames[t][i]);
+          if (!started) {{
+            ctx.moveTo(p[0], p[1]);
+            started = true;
+          }} else {{
+            ctx.lineTo(p[0], p[1]);
+            drawnSegments += 1;
+          }}
+        }}
         ctx.stroke();
-      }});
-      ctx.globalAlpha = 1;
-      for (let i = 0; i < trackCount; i++) {{
-        const p = project(frames[frame][i]);
-        ctx.fillStyle = palette[Math.abs(clusters[i] || 0) % palette.length];
+        const end = project(frames[frames.length - 1][i]);
+        ctx.globalAlpha = 0.9;
+        ctx.fillStyle = color;
         ctx.beginPath();
-        ctx.arc(p[0], p[1], 3.2, 0, Math.PI * 2);
+        ctx.arc(end[0], end[1], 2.6, 0, Math.PI * 2);
         ctx.fill();
+        drawnTracks += 1;
       }}
-      readout.textContent = `${{frame + 1}} / ${{frames.length}}`;
-      frameSlider.value = String(frame);
-    }}
-
-    function tick(ts) {{
-      if (playing && ts - lastTick > 65) {{
-        frame = (frame + 1) % frames.length;
-        lastTick = ts;
-        draw();
+      ctx.globalAlpha = 1;
+      if (readout) {{
+        readout.textContent = 'drawn tracks ' + drawnTracks + '/' + sourceTrackCount + ' | frame step ' + frameStep + ' | segments ' + drawnSegments;
       }}
-      requestAnimationFrame(tick);
     }}
 
     canvas.addEventListener('pointerdown', (event) => {{
@@ -1304,23 +1534,13 @@ def write_dashboard(path, data, artifact_paths):
     canvas.addEventListener('pointerup', () => {{ dragging = false; }});
     canvas.addEventListener('wheel', (event) => {{
       event.preventDefault();
-      zoom *= event.deltaY > 0 ? 0.92 : 1.08;
-      zoom = Math.max(0.35, Math.min(4.0, zoom));
+      zoom *= event.deltaY > 0 ? 0.9 : 1.12;
+      zoom = Math.max(0.2, Math.min(32.0, zoom));
       draw();
     }}, {{ passive: false }});
-    frameSlider.addEventListener('input', () => {{
-      frame = Number(frameSlider.value);
-      playing = false;
-      playButton.textContent = 'Play';
-      draw();
-    }});
-    playButton.addEventListener('click', () => {{
-      playing = !playing;
-      playButton.textContent = playing ? 'Pause' : 'Play';
-    }});
-    document.querySelectorAll('[data-view]').forEach((button) => {{
+    document.querySelectorAll('[data-path-view]').forEach((button) => {{
       button.addEventListener('click', () => {{
-        const view = button.getAttribute('data-view');
+        const view = button.getAttribute('data-path-view');
         if (view === 'front') {{ yaw = 0; pitch = 0; }}
         if (view === 'side') {{ yaw = Math.PI / 2; pitch = 0; }}
         if (view === 'top') {{ yaw = 0; pitch = Math.PI / 2 - 0.02; }}
@@ -1329,7 +1549,6 @@ def write_dashboard(path, data, artifact_paths):
     }});
     window.addEventListener('resize', resizeCanvas);
     resizeCanvas();
-    requestAnimationFrame(tick);
   }})();
   </script>
 </body>
@@ -1431,9 +1650,13 @@ def main():
     parser.add_argument("--knn_k", default=8, type=int)
     parser.add_argument("--motion_threshold", default=-1.0, type=float, help="Path-length threshold for moving Gaussians; negative uses adaptive threshold")
     parser.add_argument("--track_count", default=128, type=int, help="Moving Gaussian tracks to export and visualize")
-    parser.add_argument("--viewer_point_count", default=1800, type=int, help="Downsampled animated 3D Gaussian points shown in the dashboard viewer")
+    parser.add_argument("--viewer_point_count", default=-1, type=int, help="Point count shown in the dashboard point viewer; -1 keeps all points from --viewer_cloud_mode")
+    parser.add_argument("--viewer_cloud_mode", default="moving", choices=["moving", "mixed", "all"], help="Which Gaussians are embedded in the dashboard point viewer")
+    parser.add_argument("--dashboard_max_tracks", default=2400, type=int, help="Maximum moving tracks embedded in the HTML dashboard viewer; full selected tracks are still exported")
+    parser.add_argument("--dashboard_max_cloud_points", default=-1, type=int, help="Maximum Gaussian cloud points embedded in the HTML dashboard viewer; -1 keeps all viewer points")
     parser.add_argument("--track_camera_count", default=2, type=int, help="Camera views used for track-overlay videos")
     parser.add_argument("--track_stride", default=2, type=int, help="Temporal stride for track-overlay videos")
+    parser.add_argument("--track_fps", default=18, type=int, help="Frames per second for generated track-overlay videos")
     parser.add_argument("--trail_length", default=32, type=int, help="Number of sampled frames retained in each rendered trail")
     parser.add_argument("--skip_dashboard", action="store_true")
     parser.add_argument("--skip_track_video", action="store_true")
@@ -1484,7 +1707,7 @@ def main():
     selected_track_ids = selected_cpu[selected_track_idx].tolist() if selected_track_idx.numel() else []
     selected_track_labels = labels[selected_track_idx].tolist() if selected_track_idx.numel() and labels.numel() else [-1] * len(selected_track_ids)
     selected_track_lengths = motion_metrics["path_length"][selected_track_idx].tolist() if selected_track_idx.numel() else []
-    viewer_point_idx = select_viewer_point_indices(moving_mask, motion_metrics["path_length"], opacity_cpu, args.viewer_point_count)
+    viewer_point_idx = select_viewer_point_indices(moving_mask, motion_metrics["path_length"], opacity_cpu, args.viewer_point_count, args.viewer_cloud_mode)
     viewer_cloud_subset = tracks[:, viewer_point_idx, :] if viewer_point_idx.numel() else torch.empty(tracks.shape[0], 0, 3)
     viewer_cloud_groups = moving_mask[viewer_point_idx].long() if viewer_point_idx.numel() else torch.empty(0, dtype=torch.long)
 
@@ -1511,6 +1734,7 @@ def main():
         videos_dir,
         args.trail_length,
         args.track_stride,
+        args.track_fps,
     )
 
     results = {
@@ -1523,8 +1747,12 @@ def main():
         "motion_threshold": finite_float(args.motion_threshold),
         "track_count": int(args.track_count),
         "viewer_point_count": int(args.viewer_point_count),
+        "viewer_cloud_mode": args.viewer_cloud_mode,
+        "dashboard_max_tracks": int(args.dashboard_max_tracks),
+        "dashboard_max_cloud_points": int(args.dashboard_max_cloud_points),
         "track_camera_count": int(args.track_camera_count),
         "track_stride": int(args.track_stride),
+        "track_fps": int(args.track_fps),
         "trail_length": int(args.trail_length),
         "num_times": int(args.num_times),
         "times": [finite_float(v) for v in times.tolist()],
@@ -1590,6 +1818,8 @@ def main():
             selected_track_lengths,
             viewer_cloud_subset,
             viewer_cloud_groups,
+            max_tracks=args.dashboard_max_tracks,
+            max_cloud_points=args.dashboard_max_cloud_points,
         ),
     }
 
