@@ -88,6 +88,10 @@ TRACK_COLORS = [
 ]
 
 
+def log_progress(message):
+    print(f"[trajectory_metrics] {message}", flush=True)
+
+
 def finite_float(value):
     value = float(value)
     if math.isfinite(value):
@@ -502,6 +506,7 @@ def make_track_viewer_data(track_subset, selected_ids, selected_labels, path_len
     viewer_track_stride = 1
     viewer_cloud_stride = 1
     if tracks.numel() == 0 or tracks.shape[1] == 0:
+        log_progress(f"Dashboard viewer data ready: embedded_tracks=0/{source_track_count}, embedded_cloud_points={source_cloud_count}/{source_cloud_count}, frames=0")
         return {"frames": [], "cloud_frames": [], "cloud_groups": [], "gaussian_ids": [], "clusters": [], "path_lengths": [], "bounds": None, "source_track_count": 0, "source_cloud_count": source_cloud_count, "viewer_track_stride": 1, "viewer_cloud_stride": viewer_cloud_stride}
 
     if max_tracks > 0 and tracks.shape[1] > max_tracks:
@@ -549,6 +554,11 @@ def make_track_viewer_data(track_subset, selected_ids, selected_labels, path_len
     normalized_cloud = (cloud_values - center.reshape(1, 1, 3)) / scale if cloud_values.size else cloud_values
     rounded = np.round(normalized, 5)
     rounded_cloud = np.round(normalized_cloud, 5) if normalized_cloud.size else normalized_cloud
+    log_progress(
+        f"Dashboard viewer data ready: embedded_tracks={tracks.shape[1]}/{source_track_count}, "
+        f"embedded_cloud_points={cloud.shape[1] if cloud.ndim >= 2 else 0}/{source_cloud_count}, "
+        f"frames={tracks.shape[0]}, track_stride={viewer_track_stride}, cloud_stride={viewer_cloud_stride}"
+    )
     return {
         "frames": rounded.tolist(),
         "cloud_frames": rounded_cloud.tolist(),
@@ -694,13 +704,21 @@ def compute_motion_diversity(tracks, path_length, max_clusters=8):
     if n == 0:
         return {"effective_pca_rank": None, "pca_explained_variance": [], "cluster_counts": []}, torch.empty(0)
 
+    feature_dim = int(tracks.shape[0] * tracks.shape[2])
+    cluster_count = min(max_clusters, n)
+    log_progress(
+        f"Computing motion diversity: gaussians={n}, frames={tracks.shape[0]}, "
+        f"feature_dim={feature_dim}, clusters={cluster_count}"
+    )
     motion = tracks - tracks[0:1]
     features = motion.permute(1, 0, 2).reshape(n, -1).double()
     features = features / (path_length.double().reshape(-1, 1) + 1e-8)
     features = features - features.mean(dim=0, keepdim=True)
 
+    log_progress(f"Computing motion diversity PCA: covariance_shape={features.shape[1]}x{features.shape[1]}")
     cov = features.T.matmul(features) / max(n - 1, 1)
     eigvals, eigvecs = torch.linalg.eigh(cov)
+    log_progress("Motion diversity PCA complete")
     eigvals = torch.flip(eigvals.clamp_min(0), dims=(0,))
     eigvecs = torch.flip(eigvecs, dims=(1,))
     total = eigvals.sum()
@@ -710,8 +728,9 @@ def compute_motion_diversity(tracks, path_length, max_clusters=8):
 
     dims = min(6, eigvecs.shape[1], n)
     reduced = features.matmul(eigvecs[:, :dims]).float() if dims > 0 else torch.zeros(n, 1)
-    cluster_count = min(max_clusters, n)
+    log_progress(f"Clustering motion features: gaussians={n}, reduced_dim={dims}, clusters={cluster_count}")
     labels = kmeans(reduced, cluster_count) if cluster_count > 1 else torch.zeros(n, dtype=torch.long)
+    log_progress("Motion feature clustering complete")
     counts = torch.bincount(labels, minlength=cluster_count)
 
     return {
@@ -1691,25 +1710,38 @@ def main():
     knn_idx, base_dist = compute_knn(tracks[0], args.knn_k)
     mean_stretch, max_stretch = compute_local_coherence(tracks, knn_idx, base_dist)
     diversity, labels = compute_motion_diversity(tracks, motion_metrics["path_length"])
+    log_progress("Computing motion split")
     motion_split, moving_mask = compute_motion_split(motion_metrics["path_length"], tracks, args.motion_threshold)
+    log_progress(f"Motion split complete: moving={int(moving_mask.sum())}, static={int((~moving_mask).sum())}")
+    log_progress("Computing projection summary" if not args.skip_projection else "Skipping projection summary")
     projection_summary = [] if args.skip_projection else compute_projection_summary(tracks, scene)
+    log_progress(f"Projection summary complete: cameras={len(projection_summary)}")
 
     selected_cpu = selected.detach().cpu()
     opacity_cpu = selected_opacity.detach().cpu()
     static_mask = ~moving_mask
+    log_progress("Computing static/moving group summaries")
     group_stats = {
         "static": summarize_group(static_mask, selected_cpu, opacity_cpu, labels, motion_metrics, mean_stretch, max_stretch),
         "moving": summarize_group(moving_mask, selected_cpu, opacity_cpu, labels, motion_metrics, mean_stretch, max_stretch),
     }
+    log_progress("Group summaries complete")
 
+    log_progress(f"Selecting moving tracks: requested={args.track_count}")
     selected_track_idx = select_track_indices(moving_mask, labels, motion_metrics["path_length"], args.track_count)
     track_subset = tracks[:, selected_track_idx, :] if selected_track_idx.numel() else torch.empty(tracks.shape[0], 0, 3)
     selected_track_ids = selected_cpu[selected_track_idx].tolist() if selected_track_idx.numel() else []
     selected_track_labels = labels[selected_track_idx].tolist() if selected_track_idx.numel() and labels.numel() else [-1] * len(selected_track_ids)
     selected_track_lengths = motion_metrics["path_length"][selected_track_idx].tolist() if selected_track_idx.numel() else []
+    log_progress(f"Track selection complete: selected_tracks={int(selected_track_idx.numel())}, frames={tracks.shape[0]}")
+    log_progress(
+        f"Selecting viewer cloud: mode={args.viewer_cloud_mode}, viewer_point_count={args.viewer_point_count}, "
+        f"dashboard_max_cloud_points={args.dashboard_max_cloud_points}"
+    )
     viewer_point_idx = select_viewer_point_indices(moving_mask, motion_metrics["path_length"], opacity_cpu, args.viewer_point_count, args.viewer_cloud_mode)
     viewer_cloud_subset = tracks[:, viewer_point_idx, :] if viewer_point_idx.numel() else torch.empty(tracks.shape[0], 0, 3)
     viewer_cloud_groups = moving_mask[viewer_point_idx].long() if viewer_point_idx.numel() else torch.empty(0, dtype=torch.long)
+    log_progress(f"Viewer cloud selection complete: selected_cloud_points={int(viewer_point_idx.numel())}, frames={tracks.shape[0]}")
 
     all_video_cameras = scene.getTestCameras() + scene.getTrainCameras()
     video_camera_sequences = [] if args.skip_track_video else select_camera_sequences(all_video_cameras, max(0, args.track_camera_count))
@@ -1717,6 +1749,10 @@ def main():
         f"cam_{camera_key}" if isinstance(camera_key, int) else str(camera_key)
         for camera_key, _ in video_camera_sequences
     ]
+    log_progress(
+        f"Preparing projected tracks: cameras={len(video_camera_sequences)}, "
+        f"frames={tracks.shape[0]}, tracks={int(track_subset.shape[1])}"
+    )
     projected_track_sets = []
     for _, camera_sequence in video_camera_sequences:
         projected_frames = []
@@ -1724,7 +1760,12 @@ def main():
             frame_camera = nearest_camera_for_time(camera_sequence, time_value)
             projected_frames.append(project_points(track_subset[time_idx], frame_camera).numpy() if track_subset.numel() else np.empty((0, 2), dtype=np.float32))
         projected_track_sets.append(np.stack(projected_frames, axis=0) if projected_frames else np.empty((tracks.shape[0], 0, 2), dtype=np.float32))
+    log_progress(f"Projected tracks ready: camera_sets={len(projected_track_sets)}")
 
+    log_progress(
+        f"Rendering track videos: enabled={not args.skip_track_video}, cameras={len(video_camera_sequences)}, "
+        f"stride={args.track_stride}, fps={args.track_fps}"
+    )
     track_videos = [] if args.skip_track_video else render_track_overlay_videos(
         track_subset,
         selected_track_ids,
@@ -1736,7 +1777,9 @@ def main():
         args.track_stride,
         args.track_fps,
     )
+    log_progress(f"Track video rendering complete: videos={len(track_videos)}")
 
+    log_progress("Building metrics result object")
     results = {
         "model_path": args.model_path,
         "source_path": args.source_path,
@@ -1792,7 +1835,19 @@ def main():
         },
     }
     results["narrative"] = compute_narrative(results)
+    log_progress("Metrics result object ready")
 
+    log_progress("Preparing dashboard viewer data")
+    track_viewer_data = make_track_viewer_data(
+        track_subset,
+        selected_track_ids,
+        selected_track_labels,
+        selected_track_lengths,
+        viewer_cloud_subset,
+        viewer_cloud_groups,
+        max_tracks=args.dashboard_max_tracks,
+        max_cloud_points=args.dashboard_max_cloud_points,
+    )
     artifact_paths = {
         "plots": {
             "path_length": plots_dir / "path_length.png",
@@ -1811,23 +1866,22 @@ def main():
             "moving_paths_yz": plots_dir / "moving_paths_yz.png",
         },
         "videos": track_videos,
-        "track_viewer_data": make_track_viewer_data(
-            track_subset,
-            selected_track_ids,
-            selected_track_labels,
-            selected_track_lengths,
-            viewer_cloud_subset,
-            viewer_cloud_groups,
-            max_tracks=args.dashboard_max_tracks,
-            max_cloud_points=args.dashboard_max_cloud_points,
-        ),
+        "track_viewer_data": track_viewer_data,
     }
 
+    log_progress("Writing trajectory_metrics.json")
     (output_dir / "trajectory_metrics.json").write_text(json.dumps(results, indent=2))
+    log_progress("Writing trajectory_summary.csv")
     write_summary_csv(output_dir / "trajectory_summary.csv", selected_cpu.tolist(), opacity_cpu.tolist(), labels, moving_mask, motion_metrics, mean_stretch, max_stretch)
+    log_progress("Writing trajectory_group_summary.csv")
     write_group_summary_csv(output_dir / "trajectory_group_summary.csv", group_stats)
+    log_progress("Writing bonus_trajectory_report.md")
     write_report(output_dir / "bonus_trajectory_report.md", results)
     if not args.skip_track_export:
+        log_progress(
+            f"Writing track_samples.npz: tracks={int(track_subset.shape[1])}, frames={tracks.shape[0]}, "
+            f"projected_cameras={len(projected_track_sets)}, viewer_cloud_points={int(viewer_point_idx.numel())}"
+        )
         projected_export = np.stack(projected_track_sets, axis=0) if projected_track_sets else np.empty((0, tracks.shape[0], int(track_subset.shape[1]), 2), dtype=np.float32)
         export_track_samples(
             output_dir / "track_samples.npz",
@@ -1840,7 +1894,11 @@ def main():
             viewer_cloud_subset,
             viewer_cloud_groups,
         )
+        log_progress("Track sample export complete")
+    else:
+        log_progress("Skipping track sample export")
 
+    log_progress("Generating plots")
     make_histogram_png(motion_metrics["path_length"].numpy(), artifact_paths["plots"]["path_length"], "Path length")
     make_histogram_png(motion_metrics["mean_speed"].numpy(), artifact_paths["plots"]["mean_speed"], "Mean speed")
     make_histogram_png(motion_metrics["all_acceleration"].numpy(), artifact_paths["plots"]["acceleration"], "Acceleration")
@@ -1855,8 +1913,13 @@ def main():
     make_paths_png(track_subset, selected_track_labels, artifact_paths["plots"]["moving_paths_xy"], "Moving Gaussian paths: XY", axes=(0, 1))
     make_paths_png(track_subset, selected_track_labels, artifact_paths["plots"]["moving_paths_xz"], "Moving Gaussian paths: XZ", axes=(0, 2))
     make_paths_png(track_subset, selected_track_labels, artifact_paths["plots"]["moving_paths_yz"], "Moving Gaussian paths: YZ", axes=(1, 2))
+    log_progress("Plot generation complete")
     if not args.skip_dashboard:
+        log_progress("Writing trajectory_dashboard.html")
         write_dashboard(output_dir / "trajectory_dashboard.html", results, artifact_paths)
+        log_progress("Dashboard HTML complete")
+    else:
+        log_progress("Skipping dashboard HTML")
 
     print(f"Wrote trajectory metrics to {output_dir}")
     print(f"Sampled {selected_cpu.numel()} Gaussians at iteration {loaded_iteration}")
