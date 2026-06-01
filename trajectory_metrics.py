@@ -736,7 +736,10 @@ def project_points(points, camera):
     points = points.to(device)
     projected = geom_transform_points(points, camera.full_proj_transform)
     x = (projected[:, 0] + 1.0) * 0.5 * camera.image_width
-    y = (1.0 - projected[:, 1]) * 0.5 * camera.image_height
+    # The dataset images loaded for trajectory overlays use top-left image
+    # coordinates after the repository's camera transform, so applying the
+    # usual NDC Y flip mirrors tracks vertically over the video frame.
+    y = (projected[:, 1] + 1.0) * 0.5 * camera.image_height
     return torch.stack((x, y), dim=-1).detach().cpu()
 
 
