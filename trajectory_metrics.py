@@ -977,11 +977,11 @@ def metric_card(title, value, caption):
     )
 
 
-def image_panel(title, src, caption):
+def plotly_panel(title, plot_id, caption):
     return (
         '<figure class="panel">'
         f"<h3>{html.escape(title)}</h3>"
-        f"<img src=\"{src}\" alt=\"{html.escape(title)}\">"
+        f"<div id=\"{html.escape(plot_id)}\" class=\"plotly-chart\" role=\"img\" aria-label=\"{html.escape(title)}\"></div>"
         f"<figcaption>{html.escape(caption)}</figcaption>"
         "</figure>"
     )
@@ -995,6 +995,52 @@ def video_panel(title, src, caption):
         f"<figcaption>{html.escape(caption)}</figcaption>"
         "</figure>"
     )
+
+
+def finite_number_list(values, max_points=None):
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    values = values[np.isfinite(values)]
+    if max_points is not None and max_points > 0 and values.size > max_points:
+        idx = np.linspace(0, values.size - 1, max_points).astype(np.int64)
+        values = values[idx]
+    return [finite_float(v) for v in values]
+
+
+def color_hex(color):
+    return "#{:02x}{:02x}{:02x}".format(*[int(max(0, min(255, c))) for c in color])
+
+
+def make_plotly_chart_data(motion_metrics, mean_stretch, static_mask, moving_mask, diversity):
+    return {
+        "colors": [color_hex(color) for color in TRACK_COLORS],
+        "histograms": {
+            "staticPathLength": {
+                "title": "Static path length",
+                "x": finite_number_list(motion_metrics["path_length"][static_mask].numpy()),
+                "xaxis": "Path length",
+            },
+            "movingPathLength": {
+                "title": "Moving path length",
+                "x": finite_number_list(motion_metrics["path_length"][moving_mask].numpy()),
+                "xaxis": "Path length",
+            },
+            "movingAcceleration": {
+                "title": "Moving mean acceleration",
+                "x": finite_number_list(motion_metrics["mean_acceleration"][moving_mask].numpy()),
+                "xaxis": "Mean acceleration",
+            },
+            "movingLocalStretch": {
+                "title": "Moving mean local stretch",
+                "x": finite_number_list(mean_stretch[moving_mask].numpy()),
+                "xaxis": "Mean local stretch",
+            },
+        },
+        "pca": {
+            "title": "PCA explained variance",
+            "x": [idx + 1 for idx, _ in enumerate(diversity.get("pca_explained_variance", []))],
+            "y": finite_number_list(np.asarray(diversity.get("pca_explained_variance", []), dtype=np.float64)),
+        },
+    }
 
 
 def write_dashboard(path, data, artifact_paths):
@@ -1048,15 +1094,16 @@ def write_dashboard(path, data, artifact_paths):
     videos = artifact_paths.get("videos", [])
     track_viewer_data = artifact_paths.get("track_viewer_data", {"frames": []})
     track_viewer_json = json.dumps(track_viewer_data, separators=(",", ":"))
+    plotly_chart_json = json.dumps(artifact_paths.get("plotly_chart_data", {}), separators=(",", ":"))
     plot_panels = [
-        image_panel("Static path length", relpath(plot_paths.get("static_path_length"), base_dir), "Near-static trajectories should concentrate close to zero."),
-        image_panel("Moving path length", relpath(plot_paths.get("moving_path_length"), base_dir), "Moving trajectories are evaluated against other moving trajectories."),
-        image_panel("Moving acceleration", relpath(plot_paths.get("moving_acceleration"), base_dir), "Shows typical and tail temporal roughness for moving Gaussians."),
-        image_panel("Moving local stretch", relpath(plot_paths.get("moving_local_stretch"), base_dir), "Neighborhood coherence among moving Gaussians."),
-        image_panel("PCA explained variance", relpath(plot_paths.get("pca_explained_variance"), base_dir), "Ordered spectrum of normalized trajectory variation."),
-        image_panel("Moving paths XY", relpath(plot_paths.get("moving_paths_xy"), base_dir), "Orthographic trajectory projection; colors indicate clusters."),
-        image_panel("Moving paths XZ", relpath(plot_paths.get("moving_paths_xz"), base_dir), "Side-view trajectory projection."),
-        image_panel("Moving paths YZ", relpath(plot_paths.get("moving_paths_yz"), base_dir), "Alternative side-view trajectory projection."),
+        plotly_panel("Static path length", "plot-static-path-length", "Near-static trajectories should concentrate close to zero."),
+        plotly_panel("Moving path length", "plot-moving-path-length", "Moving trajectories are evaluated against other moving trajectories."),
+        plotly_panel("Moving acceleration", "plot-moving-acceleration", "Shows typical and tail temporal roughness for moving Gaussians."),
+        plotly_panel("Moving local stretch", "plot-moving-local-stretch", "Neighborhood coherence among moving Gaussians."),
+        plotly_panel("PCA explained variance", "plot-pca-explained-variance", "Ordered spectrum of normalized trajectory variation."),
+        plotly_panel("Moving paths XY", "plot-moving-paths-xy", "Orthographic trajectory projection; colors indicate clusters."),
+        plotly_panel("Moving paths XZ", "plot-moving-paths-xz", "Side-view trajectory projection."),
+        plotly_panel("Moving paths YZ", "plot-moving-paths-yz", "Alternative side-view trajectory projection."),
     ]
     video_panels = [
         video_panel(
@@ -1091,6 +1138,7 @@ def write_dashboard(path, data, artifact_paths):
     th { background:var(--soft); font-size:13px; color:#30343b; }
     td { font-size:14px; }
     img, video { width:100%; display:block; border:1px solid var(--line); background:#fff; }
+    .plotly-chart { width:100%; height:430px; border:1px solid var(--line); background:#fff; }
     .plot-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(360px, 1fr)); gap:16px; }
     .viewer-shell { background:#111827; border:1px solid #273244; border-radius:8px; overflow:hidden; }
     .viewer-toolbar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; padding:12px; background:#182235; color:#eef2f7; }
@@ -1098,7 +1146,7 @@ def write_dashboard(path, data, artifact_paths):
     .viewer-toolbar button:hover { background:#31425f; }
     .viewer-toolbar input[type="range"] { flex:1; min-width:180px; }
     .viewer-toolbar label { color:#c9d4e5; font-size:13px; }
-    #trackViewer, #pathViewer { width:100%; height:620px; display:block; background:#0b1020; touch-action:none; }
+    #trackViewerPlot, #pathViewerPlot { width:100%; height:620px; display:block; background:#fff; }
     code { background:#eef1f6; padding:2px 5px; border-radius:4px; }
     footer { color:var(--muted); font-size:13px; margin-top:32px; }
     @media (max-width: 720px) { header { padding:24px 20px; } main { padding:20px 14px 40px; } .plot-grid { grid-template-columns:1fr; } }
@@ -1168,9 +1216,9 @@ def write_dashboard(path, data, artifact_paths):
       <h2>Trajectory Visualizations</h2>
       <p>The 3D viewer shows an animated downsampled Gaussian point cloud plus selected moving-Gaussian trails before camera projection. This is the best view for checking whether the learned dancer-shaped Gaussian motion and the path geometry agree. Drag to rotate; scroll to zoom.</p>
       <div class="viewer-shell">
-        <canvas id="trackViewer" width="1200" height="620"></canvas>
+        <div id="trackViewerPlot"></div>
         <div class="viewer-toolbar">
-          <button id="viewerPlay" type="button">Pause</button>
+          <button id="viewerPlay" type="button">Play</button>
           <button data-view="front" type="button">Front</button>
           <button data-view="side" type="button">Side</button>
           <button data-view="top" type="button">Top</button>
@@ -1183,7 +1231,7 @@ def write_dashboard(path, data, artifact_paths):
       <h3>Interactive moving paths</h3>
       <p class="caption">This 3D path graph draws dashboard-sampled moving-Gaussian trajectories with adaptive decimation for browser responsiveness. Full selected tracks are still exported in <code>track_samples.npz</code>. Drag to rotate; scroll to zoom.</p>
       <div class="viewer-shell">
-        <canvas id="pathViewer" width="1200" height="620"></canvas>
+        <div id="pathViewerPlot"></div>
         <div class="viewer-toolbar">
           <button data-path-view="front" type="button">Front</button>
           <button data-path-view="side" type="button">Side</button>
@@ -1207,8 +1255,282 @@ def write_dashboard(path, data, artifact_paths):
 
     <footer>Dashboard generated by <code>trajectory_metrics.py</code>. All paths are relative to this output directory.</footer>
   </main>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
   <script>
   const TRACK_VIEWER_DATA = {track_viewer_json};
+  const PLOTLY_CHART_DATA = {plotly_chart_json};
+  (() => {{
+    if (!window.Plotly) {{
+      document.querySelectorAll('.plotly-chart, #trackViewerPlot, #pathViewerPlot').forEach((node) => {{
+        node.innerHTML = '<div style="padding:24px;color:#5f6368">Plotly could not be loaded. Check the internet connection for the Plotly CDN script.</div>';
+      }});
+      return;
+    }}
+
+    const palette = PLOTLY_CHART_DATA.colors || ['#315f9f'];
+    const config = {{ responsive: true, displaylogo: false, scrollZoom: true }};
+    const baseLayout = {{
+      margin: {{ l: 56, r: 24, t: 32, b: 48 }},
+      paper_bgcolor: '#ffffff',
+      plot_bgcolor: '#ffffff',
+      font: {{ family: 'Arial, Helvetica, sans-serif', color: '#202124' }},
+    }};
+
+    function histogram(id, key) {{
+      const spec = (PLOTLY_CHART_DATA.histograms || {{}})[key];
+      const node = document.getElementById(id);
+      if (!node || !spec) return;
+      if (!spec.x || spec.x.length === 0) {{
+        node.innerHTML = '<div style="padding:24px;color:#5f6368">No finite values.</div>';
+        return;
+      }}
+      Plotly.newPlot(node, [{{
+        type: 'histogram',
+        x: spec.x,
+        nbinsx: 48,
+        marker: {{ color: '#4f76b5', line: {{ color: '#ffffff', width: 0.5 }} }},
+        hovertemplate: spec.xaxis + ': %{{x}}<br>count: %{{y}}<extra></extra>',
+      }}], {{
+        ...baseLayout,
+        title: {{ text: spec.title, font: {{ size: 13 }} }},
+        xaxis: {{ title: spec.xaxis, zeroline: false }},
+        yaxis: {{ title: 'Count', rangemode: 'tozero' }},
+        bargap: 0.02,
+      }}, config);
+    }}
+
+    function pcaBar() {{
+      const spec = PLOTLY_CHART_DATA.pca || {{}};
+      const node = document.getElementById('plot-pca-explained-variance');
+      if (!node) return;
+      if (!spec.y || spec.y.length === 0) {{
+        node.innerHTML = '<div style="padding:24px;color:#5f6368">No PCA values.</div>';
+        return;
+      }}
+      Plotly.newPlot(node, [{{
+        type: 'bar',
+        x: spec.x,
+        y: spec.y,
+        marker: {{ color: '#4f76b5' }},
+        hovertemplate: 'component: %{{x}}<br>variance: %{{y:.3%}}<extra></extra>',
+      }}], {{
+        ...baseLayout,
+        title: {{ text: spec.title || 'PCA explained variance', font: {{ size: 13 }} }},
+        xaxis: {{ title: 'Principal component', dtick: 1 }},
+        yaxis: {{ title: 'Explained variance', tickformat: '.0%', rangemode: 'tozero' }},
+      }}, config);
+    }}
+
+    function groupedTrackTraces(axisA, axisB) {{
+      const frames = TRACK_VIEWER_DATA.frames || [];
+      if (!frames.length || !frames[0] || !frames[0].length) return [];
+      const clusters = TRACK_VIEWER_DATA.clusters || [];
+      const gaussianIds = TRACK_VIEWER_DATA.gaussian_ids || [];
+      const trackCount = frames[0].length;
+      const tracesByCluster = new Map();
+      for (let i = 0; i < trackCount; i++) {{
+        const cluster = Number.isFinite(clusters[i]) ? clusters[i] : 0;
+        if (!tracesByCluster.has(cluster)) {{
+          tracesByCluster.set(cluster, {{ x: [], y: [], text: [], cluster }});
+        }}
+        const trace = tracesByCluster.get(cluster);
+        for (let t = 0; t < frames.length; t++) {{
+          const point = frames[t][i];
+          if (!point) continue;
+          trace.x.push(point[axisA]);
+          trace.y.push(point[axisB]);
+          trace.text.push('Gaussian ' + (gaussianIds[i] ?? i) + '<br>frame ' + (t + 1) + '<br>cluster ' + cluster);
+        }}
+        trace.x.push(null);
+        trace.y.push(null);
+        trace.text.push(null);
+      }}
+      return Array.from(tracesByCluster.values()).sort((a, b) => a.cluster - b.cluster).map((trace) => ({{
+        type: 'scattergl',
+        mode: 'lines',
+        name: 'cluster ' + trace.cluster,
+        x: trace.x,
+        y: trace.y,
+        text: trace.text,
+        hovertemplate: '%{{text}}<br>x: %{{x:.4f}}<br>y: %{{y:.4f}}<extra></extra>',
+        line: {{ color: palette[Math.abs(trace.cluster) % palette.length], width: 2 }},
+      }}));
+    }}
+
+    function path2d(id, axisA, axisB, axisLabelA, axisLabelB) {{
+      const node = document.getElementById(id);
+      if (!node) return;
+      const traces = groupedTrackTraces(axisA, axisB);
+      if (!traces.length) {{
+        node.innerHTML = '<div style="padding:24px;color:#5f6368">No moving paths selected.</div>';
+        return;
+      }}
+      Plotly.newPlot(node, traces, {{
+        ...baseLayout,
+        title: {{ text: axisLabelA + ' vs ' + axisLabelB + ' moving paths', font: {{ size: 13 }} }},
+        xaxis: {{ title: axisLabelA, zeroline: false, scaleanchor: 'y' }},
+        yaxis: {{ title: axisLabelB, zeroline: false }},
+        legend: {{ orientation: 'h' }},
+      }}, config);
+    }}
+
+    function cameraFor(view) {{
+      if (view === 'side') return {{ eye: {{ x: 2.2, y: 0.0, z: 0.0 }} }};
+      if (view === 'top') return {{ eye: {{ x: 0.0, y: 0.0, z: 2.2 }} }};
+      return {{ eye: {{ x: 0.0, y: -2.2, z: 0.0 }} }};
+    }}
+
+    function frameCloud(frameIndex) {{
+      const cloudFrames = TRACK_VIEWER_DATA.cloud_frames || [];
+      const pointFrames = cloudFrames.length ? cloudFrames : (TRACK_VIEWER_DATA.frames || []);
+      return pointFrames[frameIndex] || [];
+    }}
+
+    function renderTrackFrame(frameIndex) {{
+      const node = document.getElementById('trackViewerPlot');
+      if (!node) return;
+      const points = frameCloud(frameIndex);
+      if (!points.length) {{
+        node.innerHTML = '<div style="padding:24px;color:#5f6368">No 3D tracks available in this run.</div>';
+        return;
+      }}
+      const cloudGroups = TRACK_VIEWER_DATA.cloud_groups || [];
+      const colors = points.map((_, idx) => cloudGroups[idx] ? '#4dd7e8' : '#9aa4b2');
+      const trace = {{
+        type: 'scatter3d',
+        mode: 'markers',
+        name: 'Gaussian cloud',
+        x: points.map((p) => p[0]),
+        y: points.map((p) => p[1]),
+        z: points.map((p) => p[2]),
+        marker: {{ size: 2.5, color: colors, opacity: 0.82 }},
+        hovertemplate: 'x: %{{x:.4f}}<br>y: %{{y:.4f}}<br>z: %{{z:.4f}}<extra></extra>',
+      }};
+      const layout = {{
+        margin: {{ l: 0, r: 0, t: 26, b: 0 }},
+        paper_bgcolor: '#ffffff',
+        scene: {{
+          aspectmode: 'data',
+          camera: cameraFor('front'),
+          xaxis: {{ title: 'X' }},
+          yaxis: {{ title: 'Y' }},
+          zaxis: {{ title: 'Z' }},
+        }},
+        title: {{ text: 'Gaussian cloud frame ' + (frameIndex + 1), font: {{ size: 13 }} }},
+      }};
+      if (node.data && node.data.length) {{
+        Plotly.react(node, [trace], {{ ...layout, scene: {{ ...layout.scene, camera: node.layout.scene.camera }} }}, config);
+      }} else {{
+        Plotly.newPlot(node, [trace], layout, config);
+      }}
+      const readout = document.getElementById('viewerReadout');
+      if (readout) readout.textContent = (frameIndex + 1) + ' / ' + frameCloudLength() + ' | Plotly points ' + points.length + '/' + (TRACK_VIEWER_DATA.source_cloud_count || points.length);
+    }}
+
+    function frameCloudLength() {{
+      const cloudFrames = TRACK_VIEWER_DATA.cloud_frames || [];
+      return cloudFrames.length || (TRACK_VIEWER_DATA.frames || []).length;
+    }}
+
+    function renderPath3d() {{
+      const node = document.getElementById('pathViewerPlot');
+      const frames = TRACK_VIEWER_DATA.frames || [];
+      if (!node) return;
+      if (!frames.length || !frames[0] || !frames[0].length) {{
+        node.innerHTML = '<div style="padding:24px;color:#5f6368">No moving paths available in this run.</div>';
+        return;
+      }}
+      const clusters = TRACK_VIEWER_DATA.clusters || [];
+      const gaussianIds = TRACK_VIEWER_DATA.gaussian_ids || [];
+      const trackCount = frames[0].length;
+      const maxTracks = 900;
+      const step = Math.max(1, Math.ceil(trackCount / maxTracks));
+      const traces = [];
+      for (let i = 0; i < trackCount; i += step) {{
+        const cluster = Number.isFinite(clusters[i]) ? clusters[i] : 0;
+        const points = frames.map((frame) => frame[i]).filter(Boolean);
+        traces.push({{
+          type: 'scatter3d',
+          mode: 'lines+markers',
+          name: 'g' + (gaussianIds[i] ?? i),
+          showlegend: false,
+          x: points.map((p) => p[0]),
+          y: points.map((p) => p[1]),
+          z: points.map((p) => p[2]),
+          line: {{ color: palette[Math.abs(cluster) % palette.length], width: 3 }},
+          marker: {{ color: palette[Math.abs(cluster) % palette.length], size: 1.8 }},
+          hovertemplate: 'Gaussian ' + (gaussianIds[i] ?? i) + '<br>cluster ' + cluster + '<br>x: %{{x:.4f}}<br>y: %{{y:.4f}}<br>z: %{{z:.4f}}<extra></extra>',
+        }});
+      }}
+      Plotly.newPlot(node, traces, {{
+        margin: {{ l: 0, r: 0, t: 26, b: 0 }},
+        paper_bgcolor: '#ffffff',
+        scene: {{
+          aspectmode: 'data',
+          camera: cameraFor('front'),
+          xaxis: {{ title: 'X' }},
+          yaxis: {{ title: 'Y' }},
+          zaxis: {{ title: 'Z' }},
+        }},
+        title: {{ text: 'Moving Gaussian paths', font: {{ size: 13 }} }},
+      }}, config);
+      const readout = document.getElementById('pathReadout');
+      if (readout) readout.textContent = 'drawn tracks ' + traces.length + '/' + (TRACK_VIEWER_DATA.source_track_count || trackCount);
+    }}
+
+    histogram('plot-static-path-length', 'staticPathLength');
+    histogram('plot-moving-path-length', 'movingPathLength');
+    histogram('plot-moving-acceleration', 'movingAcceleration');
+    histogram('plot-moving-local-stretch', 'movingLocalStretch');
+    pcaBar();
+    path2d('plot-moving-paths-xy', 0, 1, 'X', 'Y');
+    path2d('plot-moving-paths-xz', 0, 2, 'X', 'Z');
+    path2d('plot-moving-paths-yz', 1, 2, 'Y', 'Z');
+    renderTrackFrame(0);
+    renderPath3d();
+
+    const frameSlider = document.getElementById('viewerFrame');
+    const playButton = document.getElementById('viewerPlay');
+    let frame = 0;
+    let playing = false;
+    let timer = null;
+    if (frameSlider) {{
+      frameSlider.max = String(Math.max(0, frameCloudLength() - 1));
+      frameSlider.addEventListener('input', () => {{
+        frame = Number(frameSlider.value);
+        playing = false;
+        if (playButton) playButton.textContent = 'Play';
+        if (timer) window.clearInterval(timer);
+        renderTrackFrame(frame);
+      }});
+    }}
+    if (playButton) {{
+      playButton.addEventListener('click', () => {{
+        playing = !playing;
+        playButton.textContent = playing ? 'Pause' : 'Play';
+        if (timer) window.clearInterval(timer);
+        if (playing) {{
+          timer = window.setInterval(() => {{
+            frame = (frame + 1) % Math.max(1, frameCloudLength());
+            if (frameSlider) frameSlider.value = String(frame);
+            renderTrackFrame(frame);
+          }}, 140);
+        }}
+      }});
+    }}
+    document.querySelectorAll('[data-view]').forEach((button) => {{
+      button.addEventListener('click', () => {{
+        const node = document.getElementById('trackViewerPlot');
+        if (node) Plotly.relayout(node, {{ 'scene.camera': cameraFor(button.getAttribute('data-view')) }});
+      }});
+    }});
+    document.querySelectorAll('[data-path-view]').forEach((button) => {{
+      button.addEventListener('click', () => {{
+        const node = document.getElementById('pathViewerPlot');
+        if (node) Plotly.relayout(node, {{ 'scene.camera': cameraFor(button.getAttribute('data-path-view')) }});
+      }});
+    }});
+  }})();
   (() => {{
     const canvas = document.getElementById('trackViewer');
     const frameSlider = document.getElementById('viewerFrame');
@@ -1867,6 +2189,7 @@ def main():
         },
         "videos": track_videos,
         "track_viewer_data": track_viewer_data,
+        "plotly_chart_data": make_plotly_chart_data(motion_metrics, mean_stretch, static_mask, moving_mask, diversity),
     }
 
     log_progress("Writing trajectory_metrics.json")
