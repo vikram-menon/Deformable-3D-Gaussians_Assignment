@@ -1375,9 +1375,10 @@ def write_dashboard(path, data, artifact_paths):
     }}
 
     function cameraFor(view) {{
-      if (view === 'side') return {{ eye: {{ x: 2.2, y: 0.0, z: 0.0 }} }};
-      if (view === 'top') return {{ eye: {{ x: 0.0, y: 0.0, z: 2.2 }} }};
-      return {{ eye: {{ x: 0.0, y: -2.2, z: 0.0 }} }};
+      const common = {{ center: {{ x: 0.0, y: 0.0, z: 0.0 }}, up: {{ x: 0.0, y: -1.0, z: 0.0 }} }};
+      if (view === 'side') return {{ ...common, eye: {{ x: 2.2, y: 0.0, z: 0.0 }} }};
+      if (view === 'top') return {{ ...common, eye: {{ x: 0.0, y: 2.2, z: 0.0 }}, up: {{ x: 0.0, y: 0.0, z: 1.0 }} }};
+      return {{ ...common, eye: {{ x: 0.0, y: 0.0, z: 2.2 }} }};
     }}
 
     function frameCloud(frameIndex) {{
